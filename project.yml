@@ -1,0 +1,58 @@
+name: MusicTagger
+options:
+  bundleIdPrefix: app.musictagger
+  deploymentTarget:
+    macOS: "14.0"
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: "5.10"
+    ARCHS: arm64
+    ONLY_ACTIVE_ARCH: YES
+    MACOSX_DEPLOYMENT_TARGET: "14.0"
+    DEVELOPMENT_TEAM: ""
+    CODE_SIGN_STYLE: Automatic
+    ENABLE_HARDENED_RUNTIME: YES
+targets:
+  MusicTagger:
+    type: application
+    platform: macOS
+    sources:
+      - path: MusicTagger
+        excludes:
+          - "Resources/**"
+      - path: MusicTagger/Resources/AppIcon.icns
+        buildPhase: resources
+    info:
+      path: MusicTagger/Info.plist
+      properties:
+        CFBundleName: MusicTagger
+        CFBundleDisplayName: Music Tagger
+        CFBundleShortVersionString: "0.1.0"
+        CFBundleVersion: "1"
+        CFBundleIconFile: AppIcon
+        LSMinimumSystemVersion: "14.0"
+        NSHumanReadableCopyright: "© 2026"
+        NSHighResolutionCapable: true
+    entitlements:
+      path: MusicTagger/MusicTagger.entitlements
+      properties:
+        com.apple.security.app-sandbox: true
+        com.apple.security.files.user-selected.read-write: true
+        com.apple.security.files.bookmarks.app-scope: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: app.musictagger.MusicTagger
+        GENERATE_INFOPLIST_FILE: NO
+        CODE_SIGN_ENTITLEMENTS: MusicTagger/MusicTagger.entitlements
+  MusicTaggerTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: MusicTaggerTests
+    dependencies:
+      - target: MusicTagger
+    settings:
+      base:
+        BUNDLE_LOADER: "$(TEST_HOST)"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/MusicTagger.app/Contents/MacOS/MusicTagger"

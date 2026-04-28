@@ -1,0 +1,82 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "MusicTagger: Generate Xcode Project",
+            "type": "shell",
+            "command": "xcodegen generate",
+            "options": { "cwd": "${workspaceFolder}" },
+            "problemMatcher": []
+        },
+        {
+            "label": "MusicTagger: Generate App Icon",
+            "type": "shell",
+            "command": "swift Scripts/generate_icon.swift",
+            "options": { "cwd": "${workspaceFolder}" },
+            "problemMatcher": []
+        },
+        {
+            "label": "MusicTagger: Build (Debug)",
+            "type": "shell",
+            "command": "xcodebuild",
+            "args": [
+                "-project", "MusicTagger.xcodeproj",
+                "-scheme", "MusicTagger",
+                "-configuration", "Debug",
+                "-destination", "platform=macOS,arch=arm64",
+                "-derivedDataPath", "build",
+                "CODE_SIGNING_ALLOWED=NO",
+                "build"
+            ],
+            "options": { "cwd": "${workspaceFolder}" },
+            "group": { "kind": "build", "isDefault": true },
+            "dependsOn": ["MusicTagger: Generate Xcode Project"],
+            "problemMatcher": [
+                {
+                    "owner": "swift",
+                    "fileLocation": ["absolute"],
+                    "pattern": {
+                        "regexp": "^(.+):(\\d+):(\\d+):\\s+(error|warning|note):\\s+(.+)$",
+                        "file": 1, "line": 2, "column": 3, "severity": 4, "message": 5
+                    }
+                }
+            ]
+        },
+        {
+            "label": "MusicTagger: Run",
+            "type": "shell",
+            "command": "open",
+            "args": [
+                "-W", "-n",
+                "${workspaceFolder}/build/Build/Products/Debug/MusicTagger.app"
+            ],
+            "options": { "cwd": "${workspaceFolder}" },
+            "dependsOn": ["MusicTagger: Build (Debug)"],
+            "problemMatcher": []
+        },
+        {
+            "label": "MusicTagger: Test",
+            "type": "shell",
+            "command": "xcodebuild",
+            "args": [
+                "-project", "MusicTagger.xcodeproj",
+                "-scheme", "MusicTagger",
+                "-destination", "platform=macOS,arch=arm64",
+                "-derivedDataPath", "build",
+                "CODE_SIGNING_ALLOWED=NO",
+                "test"
+            ],
+            "options": { "cwd": "${workspaceFolder}" },
+            "group": { "kind": "test", "isDefault": true },
+            "dependsOn": ["MusicTagger: Generate Xcode Project"],
+            "problemMatcher": []
+        },
+        {
+            "label": "MusicTagger: Clean",
+            "type": "shell",
+            "command": "rm -rf build MusicTagger.xcodeproj",
+            "options": { "cwd": "${workspaceFolder}" },
+            "problemMatcher": []
+        }
+    ]
+}

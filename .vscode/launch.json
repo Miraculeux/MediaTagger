@@ -1,0 +1,21 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Run MusicTagger (open .app)",
+            "type": "node-terminal",
+            "request": "launch",
+            "command": "open -W -n ${workspaceFolder}/build/Build/Products/Debug/MusicTagger.app",
+            "preLaunchTask": "MusicTagger: Build (Debug)"
+        },
+        {
+            "name": "Debug MusicTagger (CodeLLDB)",
+            "type": "lldb",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/Build/Products/Debug/MusicTagger.app/Contents/MacOS/MusicTagger",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "preLaunchTask": "MusicTagger: Build (Debug)"
+        }
+    ]
+}
