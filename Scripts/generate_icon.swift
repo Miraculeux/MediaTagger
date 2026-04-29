@@ -1,5 +1,5 @@
 #!/usr/bin/env swift
-// Generates MusicTagger/Resources/AppIcon.icns
+// Generates MediaTagger/Resources/AppIcon.icns
 //
 // Usage: swift Scripts/generate_icon.swift
 //
@@ -96,7 +96,7 @@ func renderIcon(size: Int) -> Data {
 
 let scriptURL = URL(fileURLWithPath: CommandLine.arguments[0])
 let projectRoot = scriptURL.deletingLastPathComponent().deletingLastPathComponent()
-let resourcesDir = projectRoot.appendingPathComponent("MusicTagger/Resources")
+let resourcesDir = projectRoot.appendingPathComponent("MediaTagger/Resources")
 let iconsetDir = resourcesDir.appendingPathComponent("AppIcon.iconset")
 let icnsURL = resourcesDir.appendingPathComponent("AppIcon.icns")
 

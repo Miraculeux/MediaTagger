@@ -48,6 +48,9 @@ final class AppState: ObservableObject {
     }
 
     func setRoot(_ url: URL) {
+        // Release any previous root, then claim the new one.
+        if let old = rootURL, old != url { SecurityScope.stop(old) }
+        SecurityScope.start(url)
         rootURL = url
         selectedFolder = url
         loadFiles(in: url)
@@ -229,7 +232,6 @@ final class AppState: ObservableObject {
                 relativeTo: nil,
                 bookmarkDataIsStale: &stale
             )
-            _ = url.startAccessingSecurityScopedResource()
             setRoot(url)
         } catch {
             // ignore – user will pick again

@@ -1,5 +1,5 @@
 import XCTest
-@testable import MusicTagger
+@testable import MediaTagger
 
 final class BatchOperationsTests: XCTestCase {
 

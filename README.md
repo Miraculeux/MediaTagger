@@ -1,4 +1,4 @@
-# MusicTagger
+# MediaTagger
 
 Native macOS app (SwiftUI, Apple Silicon, macOS 14+) for viewing and editing
 audio file metadata — focused on FLAC.
@@ -7,19 +7,19 @@ audio file metadata — focused on FLAC.
 
 Three-pane `NavigationSplitView`:
 
-1. **Sidebar** ([SidebarView](MusicTagger/Views/SidebarView.swift)) — folder
+1. **Sidebar** ([SidebarView](MediaTagger/Views/SidebarView.swift)) — folder
    navigator rooted at a user-chosen folder.
-2. **File list** ([FileListView](MusicTagger/Views/FileListView.swift)) — media
+2. **File list** ([FileListView](MediaTagger/Views/FileListView.swift)) — media
    files in the selected folder with their `TITLE` tag.
-3. **Property grid** ([MetadataEditorView](MusicTagger/Views/MetadataEditorView.swift))
+3. **Property grid** ([MetadataEditorView](MediaTagger/Views/MetadataEditorView.swift))
    — cover art + editable `KEY` / `value` rows.
 
-State: [AppState](MusicTagger/Models/AppState.swift) (`@MainActor`
+State: [AppState](MediaTagger/Models/AppState.swift) (`@MainActor`
 `ObservableObject`).
 
 ## FLAC engine
 
-[FlacFile](MusicTagger/Services/FlacFile.swift) is a dependency-free Swift
+[FlacFile](MediaTagger/Services/FlacFile.swift) is a dependency-free Swift
 implementation that:
 
 - Parses the metadata block chain after the `fLaC` marker.
@@ -29,7 +29,7 @@ implementation that:
   (using padding); otherwise rewrites the file atomically.
 
 Other formats (`mp3`, `m4a`, …) are read via `AVAsset` in
-[MetadataService](MusicTagger/Services/MetadataService.swift). Writing for
+[MetadataService](MediaTagger/Services/MetadataService.swift). Writing for
 non-FLAC formats is intentionally not implemented in stage 1.
 
 ## Build
@@ -38,9 +38,9 @@ The project is generated with [XcodeGen](https://github.com/yonaskolb/XcodeGen):
 
 ```sh
 brew install xcodegen
-cd MusicTagger
+cd MediaTagger
 xcodegen generate
-open MusicTagger.xcodeproj
+open MediaTagger.xcodeproj
 ```
 
 Then ⌘R. Targets `arm64` only, macOS 14+.
@@ -48,7 +48,7 @@ Then ⌘R. Targets `arm64` only, macOS 14+.
 To run tests:
 
 ```sh
-xcodebuild -project MusicTagger.xcodeproj -scheme MusicTagger \
+xcodebuild -project MediaTagger.xcodeproj -scheme MediaTagger \
   -destination 'platform=macOS,arch=arm64' test
 ```
 

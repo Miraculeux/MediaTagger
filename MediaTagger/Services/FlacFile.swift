@@ -94,7 +94,7 @@ struct FlacFile {
         get {
             guard let i = vorbisCommentBlockIndex,
                   let vc = try? VorbisComment.decode(blocks[i].data)
-            else { return VorbisComment(vendor: "MusicTagger", entries: []) }
+            else { return VorbisComment(vendor: "MediaTagger", entries: []) }
             return vc
         }
     }

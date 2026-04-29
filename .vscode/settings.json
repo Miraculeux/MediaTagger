@@ -1,11 +1,11 @@
 {
     "files.exclude": {
         "**/.DS_Store": true,
-        "MusicTagger.xcodeproj": true,
+        "MediaTagger.xcodeproj": true,
         "build": true
     },
     "search.exclude": {
         "build": true,
-        "MusicTagger.xcodeproj": true
+        "MediaTagger.xcodeproj": true
     }
 }

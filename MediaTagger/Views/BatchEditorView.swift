@@ -28,6 +28,10 @@ struct BatchEditorView: View {
     @State private var coverMime: String?
     @State private var clearCover = false
 
+    /// True while we're programmatically writing field values; suppresses
+    /// the "start typing -> auto-enable checkbox" behavior in `toggledField`.
+    @State private var isPrefilling = false
+
     var body: some View {
         VStack(spacing: 0) {
             header
@@ -46,6 +50,34 @@ struct BatchEditorView: View {
             }
             Divider()
             footer
+        }
+        .onAppear { prefillFromFirstFile() }
+        .onChange(of: appState.selectedFileIDs) { _, _ in prefillFromFirstFile() }
+    }
+
+    /// Pre-populate field text (and cover preview) using the first selected file's
+    /// existing tags so the user can edit common values starting from a real baseline.
+    /// Toggles are left OFF — user must explicitly opt-in to apply each one.
+    private func prefillFromFirstFile() {
+        guard let first = appState.selectedFiles.first,
+              let md = try? MetadataService().read(first.url) else { return }
+        isPrefilling = true
+        defer {
+            // Drop the suppression flag on the next runloop tick, after the
+            // text-binding onChange handlers have fired.
+            DispatchQueue.main.async { isPrefilling = false }
+        }
+        if let v = md.first("ALBUM")       { album = v }
+        if let v = md.first("ALBUMARTIST") { albumArtist = v }
+        if let v = md.first("ARTIST")      { artist = v }
+        if let v = md.first("DATE")        { date = v }
+        if let v = md.first("GENRE")       { genre = v }
+        if let v = md.first("DISCNUMBER")  { discNumber = v }
+        if let v = md.first("DISCTOTAL")   { discTotal = v }
+        if let data = md.coverArt {
+            coverData = data
+            coverMime = md.coverMimeType
+            clearCover = false
         }
     }
 
@@ -175,11 +207,22 @@ struct BatchEditorView: View {
     @ViewBuilder
     private func toggledField(_ label: String, on: Binding<Bool>, text: Binding<String>) -> some View {
         HStack(spacing: 8) {
-            Toggle("", isOn: on).labelsHidden()
-            Text(label).font(.system(.body, design: .monospaced)).frame(width: 110, alignment: .leading)
+            Toggle(isOn: on) {
+                Text(label)
+                    .font(.system(.body, design: .monospaced))
+                    .frame(width: 110, alignment: .leading)
+                    .contentShape(Rectangle())
+            }
+            .toggleStyle(.checkbox)
             TextField(label.lowercased(), text: text)
                 .textFieldStyle(.roundedBorder)
-                .disabled(!on.wrappedValue)
+                .opacity(on.wrappedValue ? 1.0 : 0.6)
+                // Enable the operation as soon as the user types or focuses this field.
+                .onChange(of: text.wrappedValue) { _, newValue in
+                    if !isPrefilling, !newValue.isEmpty, !on.wrappedValue {
+                        on.wrappedValue = true
+                    }
+                }
         }
     }
 

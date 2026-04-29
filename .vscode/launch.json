@@ -2,20 +2,20 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Run MusicTagger (open .app)",
+            "name": "Run MediaTagger (open .app)",
             "type": "node-terminal",
             "request": "launch",
-            "command": "open -W -n ${workspaceFolder}/build/Build/Products/Debug/MusicTagger.app",
-            "preLaunchTask": "MusicTagger: Build (Debug)"
+            "command": "open -W -n ${workspaceFolder}/build/Build/Products/Debug/MediaTagger.app",
+            "preLaunchTask": "MediaTagger: Build (Debug)"
         },
         {
-            "name": "Debug MusicTagger (CodeLLDB)",
+            "name": "Debug MediaTagger (CodeLLDB)",
             "type": "lldb",
             "request": "launch",
-            "program": "${workspaceFolder}/build/Build/Products/Debug/MusicTagger.app/Contents/MacOS/MusicTagger",
+            "program": "${workspaceFolder}/build/Build/Products/Debug/MediaTagger.app/Contents/MacOS/MediaTagger",
             "args": [],
             "cwd": "${workspaceFolder}",
-            "preLaunchTask": "MusicTagger: Build (Debug)"
+            "preLaunchTask": "MediaTagger: Build (Debug)"
         }
     ]
 }

@@ -1,11 +1,11 @@
 import XCTest
-@testable import MusicTagger
+@testable import MediaTagger
 
 final class FlacFileTests: XCTestCase {
 
     func testVorbisCommentRoundTrip() throws {
         let vc = VorbisComment(
-            vendor: "MusicTagger 0.1",
+            vendor: "MediaTagger 0.1",
             entries: [
                 ("TITLE", "Hello, 世界"),
                 ("ARTIST", "Test Artist"),

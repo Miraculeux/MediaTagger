@@ -5,6 +5,7 @@ import UniformTypeIdentifiers
 /// Right pane: property-grid style metadata editor.
 struct MetadataEditorView: View {
     @EnvironmentObject var appState: AppState
+    @State private var showOtherTags: Bool = false
 
     var body: some View {
         if appState.selectedFile == nil {
@@ -27,7 +28,7 @@ struct MetadataEditorView: View {
                     Divider()
                     standardFieldsSection
                     Divider()
-                    tagsSection(md)
+                    otherTagsSection(md)
                 }
                 .padding(16)
             }
@@ -35,6 +36,13 @@ struct MetadataEditorView: View {
             footerBar
         }
     }
+
+    /// Keys already exposed in the Standard Fields section.
+    private static let standardKeys: Set<String> = [
+        "TITLE", "ARTIST", "ALBUM", "ALBUMARTIST",
+        "TRACKNUMBER", "TRACKTOTAL", "DISCNUMBER", "DISCTOTAL",
+        "DATE", "GENRE"
+    ]
 
     // MARK: Standard fields
 
@@ -166,18 +174,33 @@ struct MetadataEditorView: View {
     }
 
     @ViewBuilder
-    private func tagsSection(_ md: MediaMetadata) -> some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text("Tags").font(.headline)
-                Spacer()
-                Button { appState.addTag() } label: {
-                    Label("Add", systemImage: "plus")
+    private func otherTagsSection(_ md: MediaMetadata) -> some View {
+        let extras = md.tags.filter { !Self.standardKeys.contains($0.key.uppercased()) }
+        DisclosureGroup(isExpanded: $showOtherTags) {
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(extras) { tag in
+                    TagRow(tag: tag)
+                }
+                Button {
+                    appState.addTag()
+                    showOtherTags = true
+                } label: {
+                    Label("Add custom tag", systemImage: "plus")
                 }
                 .buttonStyle(.borderless)
+                .padding(.top, 4)
             }
-            ForEach(md.tags) { tag in
-                TagRow(tag: tag)
+            .padding(.top, 6)
+        } label: {
+            HStack(spacing: 6) {
+                Text("Other Tags").font(.headline)
+                if !extras.isEmpty {
+                    Text("\(extras.count)")
+                        .font(.caption.monospacedDigit())
+                        .padding(.horizontal, 6).padding(.vertical, 1)
+                        .background(.quaternary, in: Capsule())
+                        .foregroundStyle(.secondary)
+                }
             }
         }
     }

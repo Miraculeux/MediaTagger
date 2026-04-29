@@ -1,6 +1,6 @@
-name: MusicTagger
+name: MediaTagger
 options:
-  bundleIdPrefix: app.musictagger
+  bundleIdPrefix: app.mediatagger
   deploymentTarget:
     macOS: "14.0"
   createIntermediateGroups: true
@@ -14,20 +14,20 @@ settings:
     CODE_SIGN_STYLE: Automatic
     ENABLE_HARDENED_RUNTIME: YES
 targets:
-  MusicTagger:
+  MediaTagger:
     type: application
     platform: macOS
     sources:
-      - path: MusicTagger
+      - path: MediaTagger
         excludes:
           - "Resources/**"
-      - path: MusicTagger/Resources/AppIcon.icns
+      - path: MediaTagger/Resources/AppIcon.icns
         buildPhase: resources
     info:
-      path: MusicTagger/Info.plist
+      path: MediaTagger/Info.plist
       properties:
-        CFBundleName: MusicTagger
-        CFBundleDisplayName: Music Tagger
+        CFBundleName: MediaTagger
+        CFBundleDisplayName: Media Tagger
         CFBundleShortVersionString: "0.1.0"
         CFBundleVersion: "1"
         CFBundleIconFile: AppIcon
@@ -35,24 +35,24 @@ targets:
         NSHumanReadableCopyright: "© 2026"
         NSHighResolutionCapable: true
     entitlements:
-      path: MusicTagger/MusicTagger.entitlements
+      path: MediaTagger/MediaTagger.entitlements
       properties:
         com.apple.security.app-sandbox: true
         com.apple.security.files.user-selected.read-write: true
         com.apple.security.files.bookmarks.app-scope: true
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: app.musictagger.MusicTagger
+        PRODUCT_BUNDLE_IDENTIFIER: app.mediatagger.MediaTagger
         GENERATE_INFOPLIST_FILE: NO
-        CODE_SIGN_ENTITLEMENTS: MusicTagger/MusicTagger.entitlements
-  MusicTaggerTests:
+        CODE_SIGN_ENTITLEMENTS: MediaTagger/MediaTagger.entitlements
+  MediaTaggerTests:
     type: bundle.unit-test
     platform: macOS
     sources:
-      - path: MusicTaggerTests
+      - path: MediaTaggerTests
     dependencies:
-      - target: MusicTagger
+      - target: MediaTagger
     settings:
       base:
         BUNDLE_LOADER: "$(TEST_HOST)"
-        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/MusicTagger.app/Contents/MacOS/MusicTagger"
+        TEST_HOST: "$(BUILT_PRODUCTS_DIR)/MediaTagger.app/Contents/MacOS/MediaTagger"
