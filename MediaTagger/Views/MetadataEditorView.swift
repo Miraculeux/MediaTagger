@@ -286,6 +286,16 @@ private struct StandardField: View {
             .onChange(of: appState.selectedFile?.id) { _, _ in
                 text = appState.standardTagValue(key)
             }
+            // The metadata for the selected file loads asynchronously after
+            // selection changes (see AppState.setSelection). When that load
+            // completes and replaces `metadata`, the field must re-seed its
+            // local `text` from the new value — otherwise it keeps showing
+            // the previous file's tag and gets out of sync with the file
+            // list (which reads from the `titles` cache).
+            .onChange(of: appState.metadata) { _, _ in
+                let current = appState.standardTagValue(key)
+                if text != current { text = current }
+            }
             .onChange(of: text) { _, newValue in
                 if newValue != appState.standardTagValue(key) {
                     appState.setStandardTag(key, newValue)
