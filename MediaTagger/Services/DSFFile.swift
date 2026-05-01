@@ -34,16 +34,30 @@ struct DSFFile {
 
     // MARK: - Read
 
+    /// Read the embedded ID3v2 tag from a DSF file.
+    ///
+    /// Streams via `FileHandle` so we never pay a multi-GB mmap (or full
+    /// file copy on network volumes) for a DSD album just to fetch a few
+    /// KB of ID3 tag. Total bytes read: 28-byte DSD header + tag body.
     static func read(_ url: URL) throws -> DSFFile {
-        let data = try Data(contentsOf: url, options: .mappedIfSafe)
-        guard data.count >= 28,
-              data[0] == 0x44, data[1] == 0x53, data[2] == 0x44, data[3] == 0x20
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+
+        let fileSize = (try? handle.seekToEnd()) ?? 0
+        try handle.seek(toOffset: 0)
+
+        let header = handle.readData(ofLength: 28)
+        guard header.count == 28,
+              header[0] == 0x44, header[1] == 0x53,
+              header[2] == 0x44, header[3] == 0x20
         else { throw DSFError.notDSF }                              // "DSD "
 
-        let metaPtr = leU64(data, 20)
-        if metaPtr == 0 { return DSFFile(url: url, id3Tag: nil) }
-        guard metaPtr < UInt64(data.count) else { return DSFFile(url: url, id3Tag: nil) }
-        let blob = data.subdata(in: Int(metaPtr)..<data.count)
+        let metaPtr = leU64(header, 20)
+        guard metaPtr > 0, metaPtr < fileSize else {
+            return DSFFile(url: url, id3Tag: nil)
+        }
+        try handle.seek(toOffset: metaPtr)
+        let blob = handle.readData(ofLength: Int(fileSize - metaPtr))
         return DSFFile(url: url, id3Tag: blob)
     }
 

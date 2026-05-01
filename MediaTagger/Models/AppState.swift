@@ -29,6 +29,10 @@ final class AppState: ObservableObject {
     private let bookmarkKey = "rootBookmark"
     private let metadataService = MetadataService()
 
+    /// Monotonic token to discard stale background reads when the user clicks
+    /// rapidly between files.
+    private var loadGeneration: UInt64 = 0
+
     init() {
         restoreRootBookmark()
     }
@@ -103,14 +107,34 @@ final class AppState: ObservableObject {
         selectedFileIDs = ids
         isDirty = false
         if ids.count == 1, let file = files.first(where: { ids.contains($0.id) }) {
+            // If the same file is already selected, nothing to do.
+            if selectedFile?.id == file.id { return }
             selectedFile = file
-            do {
-                metadata = try metadataService.read(file.url)
-            } catch {
-                lastError = error.localizedDescription
-                metadata = MediaMetadata()
+            // Don't clear `metadata` here — keeping the previous tags on
+            // screen while the new file loads avoids a "spinner flash" on
+            // every selection change. The new metadata replaces the old one
+            // in a single update when the off-main read finishes (typically
+            // <50 ms now that all readers stream via FileHandle).
+            loadGeneration &+= 1
+            let token = loadGeneration
+            let service = metadataService
+            let url = file.url
+            Task.detached(priority: .userInitiated) { [weak self] in
+                let result: Result<MediaMetadata, Error>
+                do { result = .success(try service.read(url)) }
+                catch { result = .failure(error) }
+                await MainActor.run {
+                    guard let self, self.loadGeneration == token else { return }
+                    switch result {
+                    case .success(let md): self.metadata = md
+                    case .failure(let err):
+                        self.lastError = err.localizedDescription
+                        self.metadata = MediaMetadata()
+                    }
+                }
             }
         } else {
+            loadGeneration &+= 1
             selectedFile = nil
             metadata = nil
         }

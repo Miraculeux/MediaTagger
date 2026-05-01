@@ -234,7 +234,7 @@ struct BatchEditorView: View {
                 ProgressView(value: appState.batchProgress).frame(width: 160)
             }
             if let err = appState.lastError {
-                Text(err).font(.caption).foregroundStyle(.red).lineLimit(2)
+                ErrorChip(message: err) { appState.lastError = nil }
             }
             Spacer()
             Button("Apply to \(appState.selectedFileIDs.count) files") {

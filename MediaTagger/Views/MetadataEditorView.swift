@@ -24,6 +24,9 @@ struct MetadataEditorView: View {
         VStack(spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
+                    if let file = appState.selectedFile {
+                        PlayerView(url: file.url)
+                    }
                     coverSection(md)
                     Divider()
                     standardFieldsSection
@@ -210,7 +213,7 @@ struct MetadataEditorView: View {
     private var footerBar: some View {
         HStack {
             if let err = appState.lastError {
-                Text(err).font(.caption).foregroundStyle(.red).lineLimit(2)
+                ErrorChip(message: err) { appState.lastError = nil }
             }
             Spacer()
             if appState.isDirty {

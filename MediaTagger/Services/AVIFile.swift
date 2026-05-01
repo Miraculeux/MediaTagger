@@ -31,33 +31,55 @@ struct AVIFile {
 
     // MARK: - Read
 
+    /// Read RIFF INFO tags from an AVI file.
+    ///
+    /// Streams top-level RIFF children via `FileHandle` rather than
+    /// `Data(contentsOf:)` so we don't pay a multi-GB mmap (or full copy on
+    /// network volumes) just to find a few hundred bytes of INFO chunk.
+    /// Total bytes read for a typical AVI: a few hundred KB at most.
     static func read(_ url: URL) throws -> AVIFile {
-        let data = try Data(contentsOf: url, options: .mappedIfSafe)
-        guard data.count >= 12,
-              data[0] == 0x52, data[1] == 0x49, data[2] == 0x46, data[3] == 0x46
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+
+        let fileSize = (try? handle.seekToEnd()) ?? 0
+        try handle.seek(toOffset: 0)
+
+        // RIFF + size + AVI — 12-byte header.
+        let header = handle.readData(ofLength: 12)
+        guard header.count >= 12,
+              header[0] == 0x52, header[1] == 0x49,
+              header[2] == 0x46, header[3] == 0x46
         else { throw AVIError.notAVI }                              // "RIFF"
-        let formType = String(data: data.subdata(in: 8..<12), encoding: .ascii) ?? ""
+        let formType = String(data: header.subdata(in: 8..<12), encoding: .ascii) ?? ""
         guard formType == "AVI " else { throw AVIError.notAVI }
 
         var entries: [(String, String)] = []
-        // Walk top-level RIFF children. Recurse one level into LIST chunks
-        // looking for an INFO list.
-        var p = 12
-        while p + 8 <= data.count {
-            let id = String(data: data.subdata(in: p..<p+4), encoding: .ascii) ?? ""
-            let size = Int(leU32(data, p + 4))
-            let payloadStart = p + 8
-            let payloadEnd = min(payloadStart + size, data.count)
+
+        // Walk top-level RIFF children: read each 8-byte chunk header, only
+        // slurp the body when it's a LIST/INFO. AVI's huge `movi` chunk is
+        // skipped over with a single seek().
+        var pos: UInt64 = 12
+        while pos + 8 <= fileSize {
+            try handle.seek(toOffset: pos)
+            let chdr = handle.readData(ofLength: 8)
+            guard chdr.count == 8 else { break }
+            let id = String(data: chdr.subdata(in: 0..<4), encoding: .ascii) ?? ""
+            let size = UInt64(leU32(chdr, 4))
+            let payloadStart = pos + 8
+            let payloadEnd = min(payloadStart + size, fileSize)
             if id == "LIST", payloadEnd - payloadStart >= 4 {
-                let listType = String(data: data.subdata(in: payloadStart..<payloadStart+4),
-                                      encoding: .ascii) ?? ""
+                // Peek the 4-byte LIST type.
+                let listTypeData = handle.readData(ofLength: 4)
+                let listType = String(data: listTypeData, encoding: .ascii) ?? ""
                 if listType == "INFO" {
+                    let bodyLen = Int(payloadEnd - payloadStart - 4)
+                    let body = handle.readData(ofLength: bodyLen)
                     entries.append(contentsOf:
-                        decodeInfoList(data, start: payloadStart + 4, end: payloadEnd))
+                        decodeInfoList(body, start: 0, end: body.count))
                 }
             }
             // pad byte if size is odd
-            p = payloadEnd + (size & 1)
+            pos = payloadEnd + (size & 1)
         }
         return AVIFile(url: url, entries: entries)
     }

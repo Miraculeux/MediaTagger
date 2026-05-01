@@ -37,52 +37,214 @@ struct MatroskaFile {
 
     // MARK: - Read
 
+    /// Read tags + cover from a Matroska file.
+    ///
+    /// We deliberately avoid `Data(contentsOf: .mappedIfSafe)` here:
+    /// for multi-GB MKVs that call frequently falls back to a full file
+    /// copy into memory (sandboxed paths, network volumes, large files all
+    /// defeat mmap), which can take minutes. Instead we open a `FileHandle`
+    /// and read only the small ranges we actually need:
+    ///   1. A small head buffer to locate EBML header + Segment header + SeekHead.
+    ///   2. For each interesting element (Tags, Attachments) the SeekHead
+    ///      points to, just enough bytes to cover the element body.
+    /// Total bytes read for a typical 5 GB MKV: a few hundred KB.
     static func read(_ url: URL) throws -> MatroskaFile {
-        let data = try Data(contentsOf: url, options: .mappedIfSafe)
-        guard data.count >= 4,
-              data[0] == 0x1A, data[1] == 0x45, data[2] == 0xDF, data[3] == 0xA3
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+
+        let fileSize = (try? handle.seekToEnd()) ?? 0
+        try handle.seek(toOffset: 0)
+
+        // 1. Read the head: enough for EBML header + Segment header + SeekHead.
+        //    SeekHead is normally <2 KB; 64 KB gives plenty of headroom.
+        let headLen = min(UInt64(64 * 1024), fileSize)
+        let head = handle.readData(ofLength: Int(headLen))
+        guard head.count >= 4,
+              head[0] == 0x1A, head[1] == 0x45, head[2] == 0xDF, head[3] == 0xA3
         else { throw MatroskaError.notMatroska }
 
-        // Find Segment.
+        // 2. Locate Segment in the head buffer.
         var p = 0
-        var segmentBodyStart = -1
-        var segmentBodyEnd = data.count
-        while p < data.count {
-            guard let (id, idLen) = EBML.readID(data, at: p) else { break }
-            guard let (size, sizeLen, isUnknown) = EBML.readSize(data, at: p + idLen) else { break }
-            let bodyStart = p + idLen + sizeLen
-            let bodyEnd = isUnknown ? data.count : (bodyStart + Int(size))
+        var segmentBodyAbs: UInt64 = 0
+        var segmentBodyEndAbs: UInt64 = fileSize
+        while p < head.count {
+            guard let (id, idLen) = EBML.readID(head, at: p),
+                  let (size, sizeLen, isUnknown) = EBML.readSize(head, at: p + idLen)
+            else { break }
+            let bodyStartAbs = UInt64(p + idLen + sizeLen)
             if id == EBML.IDs.segment {
-                segmentBodyStart = bodyStart
-                segmentBodyEnd = min(bodyEnd, data.count)
+                segmentBodyAbs = bodyStartAbs
+                segmentBodyEndAbs = isUnknown ? fileSize
+                    : min(bodyStartAbs + size, fileSize)
                 break
             }
-            p = bodyEnd
+            p = isUnknown ? head.count : Int(bodyStartAbs + size)
         }
-        guard segmentBodyStart > 0 else { throw MatroskaError.notMatroska }
+        guard segmentBodyAbs > 0 else { throw MatroskaError.notMatroska }
 
-        // Walk Segment children, decoding Tags/Attachments.
         var entries: [(String, String)] = []
         var cover: (Data, String)?
-        var q = segmentBodyStart
-        while q < segmentBodyEnd {
-            guard let (id, idLen) = EBML.readID(data, at: q) else { break }
-            guard let (size, sizeLen, _) = EBML.readSize(data, at: q + idLen) else { break }
-            let bodyStart = q + idLen + sizeLen
-            let bodyEnd = min(bodyStart + Int(size), segmentBodyEnd)
+
+        // 3. Try the SeekHead fast path. We slice the head buffer to give the
+        //    existing decoders a Data + offset view starting at the Segment body.
+        let segmentRelOffset = Int(segmentBodyAbs)
+        if segmentRelOffset < head.count {
+            let segBodyEndInHead = min(Int(segmentBodyEndAbs), head.count)
+            let seekTargets = readSeekHeadTargets(
+                head,
+                segmentBodyStart: segmentRelOffset,
+                segmentBodyEnd: segBodyEndInHead
+            )
+            if !seekTargets.isEmpty {
+                if let off = seekTargets[EBML.IDs.tags] {
+                    if let body = try readElementBody(
+                        handle: handle, fileSize: fileSize,
+                        absOffset: segmentBodyAbs + off,
+                        expectedID: EBML.IDs.tags
+                    ) {
+                        entries.append(contentsOf: decodeTags(body, start: 0, end: body.count))
+                    }
+                }
+                if let off = seekTargets[EBML.IDs.attachments] {
+                    if let body = try readElementBody(
+                        handle: handle, fileSize: fileSize,
+                        absOffset: segmentBodyAbs + off,
+                        expectedID: EBML.IDs.attachments
+                    ) {
+                        cover = decodeAttachmentsForCover(body, start: 0, end: body.count)
+                    }
+                }
+                return MatroskaFile(url: url, entries: entries, cover: cover)
+            }
+        }
+
+        // 4. Fallback: stream Segment children directly from the FileHandle,
+        //    stopping at the first Cluster. Tags/Attachments are required to
+        //    appear before the first Cluster when no SeekHead is present.
+        var abs = segmentBodyAbs
+        while abs < segmentBodyEndAbs {
+            try handle.seek(toOffset: abs)
+            let hdr = handle.readData(ofLength: 16)
+            guard let (id, idLen) = EBML.readID(hdr, at: 0),
+                  let (size, sizeLen, _) = EBML.readSize(hdr, at: idLen)
+            else { break }
+            let bodyAbs = abs + UInt64(idLen + sizeLen)
+            let bodyEndAbs = min(bodyAbs + size, segmentBodyEndAbs)
             switch id {
             case EBML.IDs.tags:
-                entries.append(contentsOf: decodeTags(data, start: bodyStart, end: bodyEnd))
+                try handle.seek(toOffset: bodyAbs)
+                let body = handle.readData(ofLength: Int(bodyEndAbs - bodyAbs))
+                entries.append(contentsOf: decodeTags(body, start: 0, end: body.count))
             case EBML.IDs.attachments:
+                try handle.seek(toOffset: bodyAbs)
+                let body = handle.readData(ofLength: Int(bodyEndAbs - bodyAbs))
                 if cover == nil {
-                    cover = decodeAttachmentsForCover(data, start: bodyStart, end: bodyEnd)
+                    cover = decodeAttachmentsForCover(body, start: 0, end: body.count)
                 }
+            case EBML.IDs.cluster:
+                return MatroskaFile(url: url, entries: entries, cover: cover)
             default:
                 break
             }
-            q = bodyEnd
+            abs = bodyEndAbs
         }
         return MatroskaFile(url: url, entries: entries, cover: cover)
+    }
+
+    /// Read element header at absolute offset `absOffset`, verify its ID,
+    /// then read and return its body bytes. Returns nil if the header does
+    /// not parse or the ID does not match.
+    private static func readElementBody(handle: FileHandle,
+                                        fileSize: UInt64,
+                                        absOffset: UInt64,
+                                        expectedID: UInt64) throws -> Data? {
+        guard absOffset + 16 <= fileSize else { return nil }
+        try handle.seek(toOffset: absOffset)
+        let hdr = handle.readData(ofLength: 16)
+        guard let (id, idLen) = EBML.readID(hdr, at: 0),
+              id == expectedID,
+              let (size, sizeLen, _) = EBML.readSize(hdr, at: idLen)
+        else { return nil }
+        let bodyAbs = absOffset + UInt64(idLen + sizeLen)
+        guard bodyAbs <= fileSize else { return nil }
+        let bodyLen = Int(min(size, fileSize - bodyAbs))
+        try handle.seek(toOffset: bodyAbs)
+        return handle.readData(ofLength: bodyLen)
+    }
+
+    /// Read SeekHead at the start of the Segment body and return a map of
+    /// `SeekID -> SeekPosition` (offsets relative to the start of the
+    /// Segment body). Returns empty if no SeekHead is found in the first
+    /// few children.
+    private static func readSeekHeadTargets(_ data: Data,
+                                            segmentBodyStart: Int,
+                                            segmentBodyEnd: Int) -> [UInt64: UInt64] {
+        var out: [UInt64: UInt64] = [:]
+        var p = segmentBodyStart
+        // Look at up to the first 4 Segment children (a SeekHead is almost
+        // always the first one, occasionally the second).
+        for _ in 0..<4 {
+            guard p < segmentBodyEnd,
+                  let (id, idLen) = EBML.readID(data, at: p),
+                  let (size, sizeLen, _) = EBML.readSize(data, at: p + idLen)
+            else { return out }
+            let bodyStart = p + idLen + sizeLen
+            let bodyEnd = min(bodyStart + Int(size), segmentBodyEnd)
+            if id == EBML.IDs.seekHead {
+                var q = bodyStart
+                while q < bodyEnd {
+                    guard let (eid, eidLen) = EBML.readID(data, at: q),
+                          let (esize, esizeLen, _) = EBML.readSize(data, at: q + eidLen)
+                    else { break }
+                    let eBody = q + eidLen + esizeLen
+                    let eEnd = min(eBody + Int(esize), bodyEnd)
+                    if eid == EBML.IDs.seek {
+                        var seekID: UInt64?
+                        var seekPos: UInt64?
+                        var r = eBody
+                        while r < eEnd {
+                            guard let (cid, cidLen) = EBML.readID(data, at: r),
+                                  let (csize, csizeLen, _) = EBML.readSize(data, at: r + cidLen)
+                            else { break }
+                            let cBody = r + cidLen + csizeLen
+                            let cEnd = min(cBody + Int(csize), eEnd)
+                            let payload = data.subdata(in: cBody..<cEnd)
+                            if cid == EBML.IDs.seekID {
+                                // SeekID payload is itself a VINT-encoded ID.
+                                var v: UInt64 = 0
+                                for b in payload { v = (v << 8) | UInt64(b) }
+                                seekID = v
+                            } else if cid == EBML.IDs.seekPosition {
+                                var v: UInt64 = 0
+                                for b in payload { v = (v << 8) | UInt64(b) }
+                                seekPos = v
+                            }
+                            r = cEnd
+                        }
+                        if let sid = seekID, let sp = seekPos { out[sid] = sp }
+                    }
+                    q = eEnd
+                }
+                return out
+            }
+            p = bodyEnd
+        }
+        return out
+    }
+
+    /// Read an EBML element header at `offset` and verify it matches
+    /// `expectedID`. Returns the body's start and end byte offsets.
+    private static func elementBody(_ data: Data, at offset: Int,
+                                    expectedID: UInt64,
+                                    parentEnd: Int) -> (start: Int, end: Int)? {
+        guard offset >= 0, offset < parentEnd,
+              let (id, idLen) = EBML.readID(data, at: offset),
+              id == expectedID,
+              let (size, sizeLen, _) = EBML.readSize(data, at: offset + idLen)
+        else { return nil }
+        let start = offset + idLen + sizeLen
+        let end = min(start + Int(size), parentEnd)
+        return (start, end)
     }
 
     private static func decodeTags(_ data: Data, start: Int, end: Int) -> [(String, String)] {
@@ -359,6 +521,10 @@ fileprivate enum EBML {
         static let segmentBytes = Data([0x18, 0x53, 0x80, 0x67])
         // Segment children we care about
         static let seekHead: UInt64      = 0x114D9B74
+        static let seek: UInt64          = 0x4DBB
+        static let seekID: UInt64        = 0x53AB
+        static let seekPosition: UInt64  = 0x53AC
+        static let cluster: UInt64       = 0x1F43B675
         static let tags: UInt64          = 0x1254C367
         static let attachments: UInt64   = 0x1941A469
         // Tag children
