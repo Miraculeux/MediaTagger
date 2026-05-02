@@ -14,6 +14,8 @@ final class AppState: ObservableObject {
 
     // Metadata for the currently-selected file
     @Published var metadata: MediaMetadata?
+    /// Technical (audio/container) properties for the currently-selected file.
+    @Published var technicalInfo: MediaTechnicalInfo?
     @Published var titles: [URL: String] = [:]   // cached titles for the file list
     @Published var tracks: [URL: String] = [:]   // cached track-number display ("03 / 12")
 
@@ -28,6 +30,9 @@ final class AppState: ObservableObject {
     private var rootBookmark: Data?
     private let bookmarkKey = "rootBookmark"
     private let metadataService = MetadataService()
+    /// Cache of stream-level tech info, keyed by URL. Invalidated when the
+    /// root folder changes or after a save (which may alter file size).
+    private var techInfoCache: [URL: MediaTechnicalInfo] = [:]
 
     /// Monotonic token to discard stale background reads when the user clicks
     /// rapidly between files.
@@ -67,6 +72,8 @@ final class AppState: ObservableObject {
         selectedFile = nil
         selectedFileIDs = []
         metadata = nil
+        technicalInfo = nil
+        techInfoCache.removeAll()
         do {
             let contents = try FileManager.default.contentsOfDirectory(
                 at: folder,
@@ -119,14 +126,20 @@ final class AppState: ObservableObject {
             let token = loadGeneration
             let service = metadataService
             let url = file.url
+            // Show cached tech info immediately if we've seen this file in
+            // this session; otherwise clear stale tech from the previous file.
+            technicalInfo = techInfoCache[url]
             Task.detached(priority: .userInitiated) { [weak self] in
-                let result: Result<MediaMetadata, Error>
-                do { result = .success(try service.read(url)) }
+                let result: Result<(MediaMetadata, MediaTechnicalInfo), Error>
+                do { result = .success(try await service.readAll(url)) }
                 catch { result = .failure(error) }
                 await MainActor.run {
                     guard let self, self.loadGeneration == token else { return }
                     switch result {
-                    case .success(let md): self.metadata = md
+                    case .success(let (md, tech)):
+                        self.metadata = md
+                        self.technicalInfo = tech
+                        self.techInfoCache[url] = tech
                     case .failure(let err):
                         self.lastError = err.localizedDescription
                         self.metadata = MediaMetadata()
@@ -137,6 +150,7 @@ final class AppState: ObservableObject {
             loadGeneration &+= 1
             selectedFile = nil
             metadata = nil
+            technicalInfo = nil
         }
     }
 
@@ -151,6 +165,9 @@ final class AppState: ObservableObject {
             isDirty = false
             titles[file.url] = md.title ?? file.name
             tracks[file.url] = md.trackDisplay ?? ""
+            // File bytes changed — invalidate cached tech info so we re-read
+            // the new file size on the next selection of this URL.
+            techInfoCache.removeValue(forKey: file.url)
         } catch {
             lastError = error.localizedDescription
         }

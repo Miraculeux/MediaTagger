@@ -31,6 +31,75 @@ struct MetadataService {
         try read(url).title
     }
 
+    /// Read both metadata and stream-level tech info in a single pass when
+    /// the format allows it. For FLAC/DSF/DFF this means **one** file scan
+    /// produces both results; for AV-backed formats we run the metadata
+    /// read synchronously and the tech-info probe asynchronously so that
+    /// AVAsset's value loading never blocks a worker thread on a semaphore.
+    func readAll(_ url: URL) async throws -> (MediaMetadata, MediaTechnicalInfo) {
+        let fileSize = (try? FileManager.default
+            .attributesOfItem(atPath: url.path)[.size] as? Int64) ?? nil
+        let container = url.pathExtension.uppercased()
+
+        switch url.pathExtension.lowercased() {
+        case "flac":
+            let file = try FlacFile.read(url)
+            return (mediaMetadata(fromFlac: file),
+                    TechnicalInfoService.finalize(
+                        TechnicalInfoService.from(flac: file, fileSize: fileSize)))
+
+        case "dsf":
+            let file = try DSFFile.read(url)
+            return (mediaMetadata(fromID3Decoded: file.decoded()),
+                    TechnicalInfoService.finalize(
+                        TechnicalInfoService.from(dsf: file, fileSize: fileSize)))
+
+        case "dff":
+            let file = try DFFFile.read(url)
+            return (mediaMetadata(fromID3Decoded: file.decoded()),
+                    TechnicalInfoService.finalize(
+                        TechnicalInfoService.from(dff: file, fileSize: fileSize)))
+
+        default:
+            // Metadata read is sync (already streaming where applicable);
+            // tech info goes through the async AV fallback.
+            let md = try read(url)
+            let tech = await TechnicalInfoService.avFallback(
+                url, container: container, fileSize: fileSize)
+            return (md, tech)
+        }
+    }
+
+    // MARK: Private metadata-from-parsed-object helpers
+
+    private func mediaMetadata(fromFlac file: FlacFile) -> MediaMetadata {
+        let vc = file.vorbisComment
+        var md = MediaMetadata(
+            vendor: vc.vendor,
+            tags: vc.entries.map { MediaMetadata.Tag(key: $0.key, value: $0.value) }
+        )
+        if let pic = file.firstPicture {
+            md.coverArt = pic.data
+            md.coverMimeType = pic.mimeType
+        }
+        return md
+    }
+
+    private func mediaMetadata(
+        fromID3Decoded decoded: (entries: [(key: String, value: String)],
+                                 cover: (data: Data, mime: String)?)
+    ) -> MediaMetadata {
+        var md = MediaMetadata(
+            vendor: nil,
+            tags: decoded.entries.map { MediaMetadata.Tag(key: $0.key, value: $0.value) }
+        )
+        if let cover = decoded.cover {
+            md.coverArt = cover.data
+            md.coverMimeType = cover.mime
+        }
+        return md
+    }
+
     func write(_ md: MediaMetadata, to url: URL) throws {
         switch url.pathExtension.lowercased() {
         case "flac": try writeFlac(md, to: url)
@@ -57,17 +126,7 @@ struct MetadataService {
     // MARK: - FLAC
 
     private func readFlac(_ url: URL) throws -> MediaMetadata {
-        let file = try FlacFile.read(url)
-        let vc = file.vorbisComment
-        var md = MediaMetadata(
-            vendor: vc.vendor,
-            tags: vc.entries.map { MediaMetadata.Tag(key: $0.key, value: $0.value) }
-        )
-        if let pic = file.firstPicture {
-            md.coverArt = pic.data
-            md.coverMimeType = pic.mimeType
-        }
-        return md
+        mediaMetadata(fromFlac: try FlacFile.read(url))
     }
 
     private func writeFlac(_ md: MediaMetadata, to url: URL) throws {
@@ -220,17 +279,7 @@ struct MetadataService {
     // MARK: - DSF (DSD Stream File, ID3v2 trailer)
 
     private func readDSF(_ url: URL) throws -> MediaMetadata {
-        let file = try DSFFile.read(url)
-        let (entries, cover) = file.decoded()
-        var md = MediaMetadata(
-            vendor: nil,
-            tags: entries.map { MediaMetadata.Tag(key: $0.key, value: $0.value) }
-        )
-        if let cover {
-            md.coverArt = cover.data
-            md.coverMimeType = cover.mime
-        }
-        return md
+        mediaMetadata(fromID3Decoded: try DSFFile.read(url).decoded())
     }
 
     private func writeDSF(_ md: MediaMetadata, to url: URL) throws {
@@ -247,17 +296,7 @@ struct MetadataService {
     // MARK: - DFF (DSDIFF, ID3v2 inside FRM8)
 
     private func readDFF(_ url: URL) throws -> MediaMetadata {
-        let file = try DFFFile.read(url)
-        let (entries, cover) = file.decoded()
-        var md = MediaMetadata(
-            vendor: nil,
-            tags: entries.map { MediaMetadata.Tag(key: $0.key, value: $0.value) }
-        )
-        if let cover {
-            md.coverArt = cover.data
-            md.coverMimeType = cover.mime
-        }
-        return md
+        mediaMetadata(fromID3Decoded: try DFFFile.read(url).decoded())
     }
 
     private func writeDFF(_ md: MediaMetadata, to url: URL) throws {

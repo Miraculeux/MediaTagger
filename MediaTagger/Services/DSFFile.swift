@@ -31,6 +31,8 @@ struct DSFFile {
     let url: URL
     /// Raw payload of the embedded ID3v2 tag (if any).
     let id3Tag: Data?
+    /// Stream-level audio properties read from the DSD/fmt chunks.
+    let techInfo: MediaTechnicalInfo
 
     // MARK: - Read
 
@@ -38,7 +40,7 @@ struct DSFFile {
     ///
     /// Streams via `FileHandle` so we never pay a multi-GB mmap (or full
     /// file copy on network volumes) for a DSD album just to fetch a few
-    /// KB of ID3 tag. Total bytes read: 28-byte DSD header + tag body.
+    /// KB of ID3 tag. Total bytes read: 80-byte DSD+fmt header + tag body.
     static func read(_ url: URL) throws -> DSFFile {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
@@ -46,19 +48,45 @@ struct DSFFile {
         let fileSize = (try? handle.seekToEnd()) ?? 0
         try handle.seek(toOffset: 0)
 
-        let header = handle.readData(ofLength: 28)
-        guard header.count == 28,
+        // 28-byte DSD chunk + 52-byte fmt chunk = 80 bytes total.
+        let header = handle.readData(ofLength: 80)
+        guard header.count >= 28,
               header[0] == 0x44, header[1] == 0x53,
               header[2] == 0x44, header[3] == 0x20
         else { throw DSFError.notDSF }                              // "DSD "
 
         let metaPtr = leU64(header, 20)
+
+        // Parse fmt chunk for tech info (best-effort — missing/short header
+        // is not fatal, we just return whatever fields we managed to read).
+        var tech = MediaTechnicalInfo()
+        tech.container = "DSF"
+        tech.codec = "DSD"
+        tech.isDSD = true
+        if header.count >= 80,
+           header[28] == 0x66, header[29] == 0x6D,
+           header[30] == 0x74, header[31] == 0x20 {              // "fmt "
+            let channelNum  = leU32(header, 48)
+            let sampleFreq  = leU32(header, 52)
+            let bitsPer     = leU32(header, 56)
+            let sampleCount = leU64(header, 60)
+            tech.channels = Int(channelNum)
+            tech.sampleRate = Double(sampleFreq)
+            tech.bitsPerSample = Int(bitsPer)
+            if sampleFreq > 0 {
+                tech.durationSeconds = Double(sampleCount) / Double(sampleFreq)
+            }
+            if sampleFreq > 0 && channelNum > 0 {
+                tech.bitrate = Double(sampleFreq) * Double(channelNum) * Double(bitsPer)
+            }
+        }
+
         guard metaPtr > 0, metaPtr < fileSize else {
-            return DSFFile(url: url, id3Tag: nil)
+            return DSFFile(url: url, id3Tag: nil, techInfo: tech)
         }
         try handle.seek(toOffset: metaPtr)
         let blob = handle.readData(ofLength: Int(fileSize - metaPtr))
-        return DSFFile(url: url, id3Tag: blob)
+        return DSFFile(url: url, id3Tag: blob, techInfo: tech)
     }
 
     /// Decode embedded ID3v2 tag (if any) into Vorbis-style entries + cover.
@@ -154,6 +182,10 @@ fileprivate func leU64(_ d: Data, _ p: Int) -> UInt64 {
     var v: UInt64 = 0
     for i in 0..<8 { v |= UInt64(d[p + i]) << (8 * i) }
     return v
+}
+
+fileprivate func leU32(_ d: Data, _ p: Int) -> UInt32 {
+    UInt32(d[p]) | (UInt32(d[p + 1]) << 8) | (UInt32(d[p + 2]) << 16) | (UInt32(d[p + 3]) << 24)
 }
 
 fileprivate func leU64Bytes(_ v: UInt64) -> Data {

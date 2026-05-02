@@ -29,6 +29,8 @@ struct DFFFile {
     let url: URL
     /// Raw payload of the embedded "ID3 " chunk (a complete ID3v2 tag), if any.
     let id3Chunk: Data?
+    /// Stream-level audio properties read from FRM8/PROP/SND sub-chunks.
+    let techInfo: MediaTechnicalInfo
 
     // MARK: - Read
 
@@ -41,19 +43,72 @@ struct DFFFile {
         guard formType == "DSD " else { throw DFFError.notDFF }
 
         // Walk top-level chunks of FRM8 starting after the 16-byte header.
+        // We extract both the ID3 tag and PROP/SND tech info in this single pass.
         var p = 16
         var id3: Data?
+        var tech = MediaTechnicalInfo()
+        tech.container = "DFF"
+        tech.codec = "DSD"
+        tech.isDSD = true
+        var dsdDataSize: UInt64 = 0
+
         while p + 12 <= data.count {
             let id = String(data: data.subdata(in: p..<p+4), encoding: .ascii) ?? ""
             let size = Int(beU64(data, p + 4))
             let payloadStart = p + 12
             let payloadEnd = min(payloadStart + size, data.count)
-            if id == "ID3 " {
+            switch id {
+            case "ID3 ":
                 id3 = data.subdata(in: payloadStart..<payloadEnd)
+            case "PROP":
+                if payloadEnd - payloadStart >= 4,
+                   String(data: data.subdata(in: payloadStart..<payloadStart+4),
+                          encoding: .ascii) == "SND " {
+                    parseSND(data, start: payloadStart + 4, end: payloadEnd, into: &tech)
+                }
+            case "DSD ":
+                dsdDataSize = UInt64(size)
+            default: break
             }
             p = payloadEnd + (size & 1)        // 1-byte pad if odd
         }
-        return DFFFile(url: url, id3Chunk: id3)
+
+        if let sr = tech.sampleRate, let ch = tech.channels, sr > 0, ch > 0 {
+            tech.bitsPerSample = 1
+            tech.bitrate = sr * Double(ch)
+            if dsdDataSize > 0 {
+                tech.durationSeconds = Double(dsdDataSize) * 8.0 / (sr * Double(ch))
+            }
+        }
+
+        return DFFFile(url: url, id3Chunk: id3, techInfo: tech)
+    }
+
+    /// Parse FS / CHNL sub-chunks of the PROP/SND property list.
+    private static func parseSND(_ data: Data, start: Int, end: Int,
+                                 into tech: inout MediaTechnicalInfo) {
+        var q = start
+        while q + 12 <= end {
+            let id = String(data: data.subdata(in: q..<q+4), encoding: .ascii) ?? ""
+            let size = Int(beU64(data, q + 4))
+            let pStart = q + 12
+            let pEnd = min(pStart + size, end)
+            switch id {
+            case "FS  ":
+                if pEnd - pStart >= 4 {
+                    let fs = (UInt32(data[pStart]) << 24) | (UInt32(data[pStart+1]) << 16)
+                           | (UInt32(data[pStart+2]) << 8)  |  UInt32(data[pStart+3])
+                    tech.sampleRate = Double(fs)
+                }
+            case "CHNL":
+                if pEnd - pStart >= 2 {
+                    let ch = (UInt16(data[pStart]) << 8) | UInt16(data[pStart+1])
+                    tech.channels = Int(ch)
+                }
+            default: break
+            }
+            q = pEnd + (size & 1)
+        }
     }
 
     /// Decode the embedded ID3v2 tag (if any) into Vorbis-style entries.

@@ -29,6 +29,10 @@ struct MetadataEditorView: View {
                     }
                     coverSection(md)
                     Divider()
+                    if let tech = appState.technicalInfo {
+                        TechnicalInfoSection(info: tech)
+                        Divider()
+                    }
                     standardFieldsSection
                     Divider()
                     otherTagsSection(md)
@@ -264,6 +268,129 @@ private struct TagRow: View {
 
     private func commit() {
         appState.updateTag(id: tag.id, key: key.uppercased(), value: value)
+    }
+}
+
+/// Read-only display of stream-level audio properties (sample rate, bit depth,
+/// bitrate, duration, channels, file size). Hidden when no info is available.
+private struct TechnicalInfoSection: View {
+    private struct Formatted {
+        let format: String?
+        let sampleRate: String?
+        let bitDepth: String?
+        let channels: String?
+        let bitrate: String?
+        let duration: String?
+        let fileSize: String?
+    }
+
+    private let f: Formatted
+
+    init(info: MediaTechnicalInfo) {
+        self.f = Self.format(info)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Info").font(.headline)
+            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 4) {
+                if let s = f.format     { row("Format",      s) }
+                if let s = f.sampleRate { row("Sample Rate", s) }
+                if let s = f.bitDepth   { row("Bit Depth",   s) }
+                if let s = f.channels   { row("Channels",    s) }
+                if let s = f.bitrate    { row("Bitrate",     s) }
+                if let s = f.duration   { row("Duration",    s) }
+                if let s = f.fileSize   { row("File Size",   s) }
+            }
+            .font(.callout.monospacedDigit())
+        }
+    }
+
+    @ViewBuilder
+    private func row(_ label: String, _ value: String) -> some View {
+        GridRow {
+            Text(label)
+                .foregroundStyle(.secondary)
+                .frame(width: 100, alignment: .trailing)
+            Text(value).textSelection(.enabled)
+        }
+    }
+
+    // MARK: Formatting (computed once at init, cached for the view's lifetime)
+
+    private static func format(_ info: MediaTechnicalInfo) -> Formatted {
+        Formatted(
+            format:     formatString(info),
+            sampleRate: sampleRateString(info),
+            bitDepth:   bitDepthString(info),
+            channels:   channelsString(info),
+            bitrate:    bitrateString(info),
+            duration:   durationString(info),
+            fileSize:   fileSizeString(info)
+        )
+    }
+
+    private static func formatString(_ info: MediaTechnicalInfo) -> String? {
+        switch (info.container, info.codec) {
+        case (let c?, let k?) where c.caseInsensitiveCompare(k) != .orderedSame:
+            return "\(c) (\(k))"
+        case (let c?, _): return c
+        case (_, let k?): return k
+        default: return nil
+        }
+    }
+
+    private static func sampleRateString(_ info: MediaTechnicalInfo) -> String? {
+        guard let sr = info.sampleRate, sr > 0 else { return nil }
+        if info.isDSD {
+            // DSD rates are conventionally expressed as multiples of 44.1 kHz
+            // (DSD64 = 2.8224 MHz, DSD128 = 5.6448 MHz, …).
+            let mhz = sr / 1_000_000
+            let multiple = Int((sr / 44_100.0).rounded())
+            return String(format: "%.4f MHz (DSD%d)", mhz, multiple)
+        }
+        let khz = sr / 1000
+        if khz.truncatingRemainder(dividingBy: 1) == 0 {
+            return "\(Int(khz)) kHz"
+        }
+        return String(format: "%.1f kHz", khz)
+    }
+
+    private static func bitDepthString(_ info: MediaTechnicalInfo) -> String? {
+        guard let b = info.bitsPerSample, b > 0 else { return nil }
+        return info.isDSD ? "1-bit (DSD)" : "\(b)-bit"
+    }
+
+    private static func channelsString(_ info: MediaTechnicalInfo) -> String? {
+        guard let ch = info.channels, ch > 0 else { return nil }
+        switch ch {
+        case 1: return "1 (Mono)"
+        case 2: return "2 (Stereo)"
+        default: return "\(ch)"
+        }
+    }
+
+    private static func bitrateString(_ info: MediaTechnicalInfo) -> String? {
+        guard let br = info.bitrate, br > 0 else { return nil }
+        if br >= 1_000_000 {
+            return String(format: "%.2f Mbps", br / 1_000_000)
+        }
+        return String(format: "%.0f kbps", br / 1000)
+    }
+
+    private static func durationString(_ info: MediaTechnicalInfo) -> String? {
+        guard let d = info.durationSeconds, d.isFinite, d > 0 else { return nil }
+        let total = Int(d.rounded())
+        let h = total / 3600
+        let m = (total % 3600) / 60
+        let s = total % 60
+        if h > 0 { return String(format: "%d:%02d:%02d", h, m, s) }
+        return String(format: "%d:%02d", m, s)
+    }
+
+    private static func fileSizeString(_ info: MediaTechnicalInfo) -> String? {
+        guard let bytes = info.fileSizeBytes, bytes > 0 else { return nil }
+        return ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
     }
 }
 
