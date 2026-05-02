@@ -71,7 +71,15 @@ private struct VLCRepresentable: NSViewRepresentable {
         private weak var slider: NSSlider?
         private weak var playButton: NSButton?
         private weak var timeLabel: NSTextField?
+        private weak var volumeSlider: NSSlider?
+        private weak var volumeButton: NSButton?
         private var isUserSeeking = false
+        /// Persisted across files so the user's chosen level survives selection changes.
+        private static let volumeDefaultsKey = "VLCPlayerView.volume"
+        private var volume: Int = {
+            let v = UserDefaults.standard.object(forKey: Coordinator.volumeDefaultsKey) as? Int
+            return v ?? 80
+        }()
 
         init(url: URL) {
             self.currentURL = url
@@ -115,6 +123,24 @@ private struct VLCRepresentable: NSViewRepresentable {
             container.addSubview(label)
             timeLabel = label
 
+            // Mute toggle + volume slider (right side of the transport bar).
+            let volBtn = NSButton()
+            volBtn.bezelStyle = .accessoryBarAction
+            volBtn.image = NSImage(systemSymbolName: volumeSymbol(for: volume),
+                                   accessibilityDescription: "Mute")
+            volBtn.target = self
+            volBtn.action = #selector(toggleMute)
+            volBtn.translatesAutoresizingMaskIntoConstraints = false
+            container.addSubview(volBtn)
+            volumeButton = volBtn
+
+            let vol = NSSlider(value: Double(volume), minValue: 0, maxValue: 200,
+                               target: self, action: #selector(volumeChanged(_:)))
+            vol.controlSize = .small
+            vol.translatesAutoresizingMaskIntoConstraints = false
+            container.addSubview(vol)
+            volumeSlider = vol
+
             NSLayoutConstraint.activate([
                 surface.topAnchor.constraint(equalTo: container.topAnchor),
                 surface.leadingAnchor.constraint(equalTo: container.leadingAnchor),
@@ -129,10 +155,19 @@ private struct VLCRepresentable: NSViewRepresentable {
                 s.centerYAnchor.constraint(equalTo: play.centerYAnchor),
                 s.trailingAnchor.constraint(equalTo: label.leadingAnchor, constant: -8),
 
-                label.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -8),
+                label.trailingAnchor.constraint(equalTo: volBtn.leadingAnchor, constant: -8),
                 label.centerYAnchor.constraint(equalTo: play.centerYAnchor),
+
+                volBtn.centerYAnchor.constraint(equalTo: play.centerYAnchor),
+                volBtn.widthAnchor.constraint(equalToConstant: 22),
+
+                vol.leadingAnchor.constraint(equalTo: volBtn.trailingAnchor, constant: 4),
+                vol.centerYAnchor.constraint(equalTo: play.centerYAnchor),
+                vol.widthAnchor.constraint(equalToConstant: 80),
+                vol.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -8),
             ])
 
+            applyVolume()
             load(currentURL)
             return container
         }
@@ -184,10 +219,54 @@ private struct VLCRepresentable: NSViewRepresentable {
             playButton?.image = NSImage(systemSymbolName: name, accessibilityDescription: nil)
         }
 
+        // MARK: Volume
+
+        @objc private func volumeChanged(_ sender: NSSlider) {
+            volume = Int(sender.doubleValue.rounded())
+            applyVolume()
+            UserDefaults.standard.set(volume, forKey: Self.volumeDefaultsKey)
+        }
+
+        @objc private func toggleMute() {
+            if player.audio?.volume ?? 0 > 0 {
+                player.audio?.volume = 0
+                volumeButton?.image = NSImage(systemSymbolName: "speaker.slash.fill",
+                                              accessibilityDescription: "Unmute")
+            } else {
+                applyVolume()
+            }
+        }
+
+        /// Push the current `volume` into libVLC. libVLC's audio output may not
+        /// be ready immediately after `play()`, so we re-apply on each load and
+        /// state change as well.
+        private func applyVolume() {
+            player.audio?.volume = Int32(volume)
+            volumeSlider?.doubleValue = Double(volume)
+            volumeButton?.image = NSImage(systemSymbolName: volumeSymbol(for: volume),
+                                          accessibilityDescription: "Volume")
+        }
+
+        private func volumeSymbol(for v: Int) -> String {
+            switch v {
+            case 0: return "speaker.slash.fill"
+            case 1...33: return "speaker.wave.1.fill"
+            case 34...66: return "speaker.wave.2.fill"
+            default: return "speaker.wave.3.fill"
+            }
+        }
+
         // MARK: VLCMediaPlayerDelegate
 
         func mediaPlayerStateChanged(_ aNotification: Notification) {
-            DispatchQueue.main.async { [weak self] in self?.updatePlayButton() }
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.updatePlayButton()
+                // libVLC resets / lazily initialises the audio output around
+                // play state changes; re-applying the user's volume keeps it
+                // sticky across loads and pause/resume.
+                self.applyVolume()
+            }
         }
 
         func mediaPlayerTimeChanged(_ aNotification: Notification) {
