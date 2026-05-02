@@ -22,3 +22,7 @@ MediaTagger/Resources/AppIcon.iconset/
 .build/
 Package.resolved
 .swiftpm/
+
+# VLCKit binary framework — fetched by Scripts/fetch_vlckit.sh, not committed.
+Frameworks/VLCKit.xcframework
+Frameworks/.vlckit-version

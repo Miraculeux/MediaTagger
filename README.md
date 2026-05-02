@@ -48,12 +48,26 @@ back to atomic rewrites when the new tag area doesn't fit.
 ## Playback
 
 [PlayerView](MediaTagger/Views/PlayerView.swift) wraps `AVPlayerView` directly
-via `NSViewRepresentable`. Only formats that AVFoundation can demux on macOS
-are playable: `mp3`, `m4a`, `m4b`, `aac`, `alac`, `wav`, `aiff`/`aif`/`aifc`,
-`flac`, `mp4`, `m4v`, `mov`. For other containers (`mkv`, `webm`, `ogg`,
-`opus`, `dsf`, `dff`, `avi`) the editor still works, but the player shows a
-"Playback not supported" placeholder — AVFoundation lacks the demuxers for
-those containers.
+via `NSViewRepresentable`. AVFoundation can demux a limited set of containers
+on macOS: `mp3`, `m4a`, `m4b`, `aac`, `alac`, `wav`, `aiff`/`aif`/`aifc`,
+`flac`, `mp4`, `m4v`, `mov`.
+
+For everything else (`mkv`, `webm`, `ogg`, `opus`, `dsf`, `dff`, `avi` with
+non-Apple codecs) the view falls back to
+[VLCPlayerView](MediaTagger/Views/VLCPlayerView.swift), a thin
+`NSViewRepresentable` over `VLCMediaPlayer` (libVLC). VLCKit is shipped as a
+binary xcframework in `Frameworks/VLCKit.xcframework` (~400 MB) but is **not**
+committed to the repo — fetch it once with:
+
+```sh
+bash Scripts/fetch_vlckit.sh
+# or, if you've already downloaded the tarball locally:
+VLCKIT_TARBALL=~/Downloads/VLCKit-3.7.3-*.tar.xz bash Scripts/fetch_vlckit.sh
+```
+
+XcodeGen marks the dependency as `optional: true`, so if the framework is
+absent the project still builds and the unsupported-format chip is shown
+instead of the VLC player.
 
 ## Batch editing
 
@@ -112,6 +126,6 @@ relaunches — see [SecurityScope](MediaTagger/Services/SecurityScope.swift).
 
 ## Roadmap
 
-- VLCKit / mpv integration to play unsupported containers (MKV, WebM, Opus, …).
 - Undo/redo across the editor.
 - Tag-mapping UI for non-standard fields per container.
+- Optional mpv backend as a smaller alternative to VLCKit.

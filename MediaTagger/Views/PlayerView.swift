@@ -11,9 +11,11 @@ import AppKit
 /// when embedded inside `ScrollView` / `NavigationSplitView`. The AppKit
 /// view gives the same compact transport bar for audio without that issue.
 ///
-/// Some container/codec combinations (Ogg, Opus, Matroska, WebM, DSD, AVI)
-/// are not natively supported by AVFoundation on macOS — for those we show
-/// a small "Playback not supported" placeholder.
+/// AVFoundation can only demux a subset of containers on macOS. For
+/// everything else (MKV, WebM, OGG, Opus, AVI with non-Apple codecs, DSD,
+/// …) we fall back to `VLCPlayerView` (libVLC), which ships in the bundle
+/// when `Frameworks/VLCKit.framework` is present (see
+/// `Scripts/fetch_vlckit.sh`).
 struct PlayerView: View {
     let url: URL
 
@@ -21,42 +23,36 @@ struct PlayerView: View {
 
     var body: some View {
         Group {
-            if PlayerView.isPlayable(url) {
+            if PlayerView.isAVPlayable(url) {
                 AVPlayerViewRepresentable(player: controller.player,
                                           showsFullScreen: isVideo(url))
                     .frame(height: isVideo(url) ? 240 : 50)
                     .clipShape(RoundedRectangle(cornerRadius: 6))
             } else {
-                HStack(spacing: 8) {
-                    Image(systemName: "speaker.slash")
-                        .foregroundStyle(.secondary)
-                    Text("Playback not supported for .\(url.pathExtension.lowercased()) files")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                }
-                .padding(.horizontal, 8)
-                .frame(height: 36)
-                .background(.quaternary, in: RoundedRectangle(cornerRadius: 6))
+                // Hand off to VLC for unsupported containers. When VLCKit
+                // isn't linked, VLCPlayerView shows the same chip the
+                // editor used to display before.
+                VLCPlayerView(url: url, isVideo: isVideo(url))
             }
         }
-        .onAppear { if PlayerView.isPlayable(url) { controller.load(url) } }
+        .onAppear { if PlayerView.isAVPlayable(url) { controller.load(url) } }
         .onChange(of: url) { _, new in
-            if PlayerView.isPlayable(new) { controller.load(new) } else { controller.stop() }
+            if PlayerView.isAVPlayable(new) { controller.load(new) } else { controller.stop() }
         }
         .onDisappear { controller.stop() }
     }
 
     private func isVideo(_ url: URL) -> Bool {
-        ["mp4", "m4v", "mov"].contains(url.pathExtension.lowercased())
+        let v: Set<String> = ["mp4", "m4v", "mov", "mkv", "webm", "avi"]
+        return v.contains(url.pathExtension.lowercased())
     }
 
     /// Extensions AVFoundation can decode out of the box on macOS.
-    static func isPlayable(_ url: URL) -> Bool {
-        playableExtensions.contains(url.pathExtension.lowercased())
+    static func isAVPlayable(_ url: URL) -> Bool {
+        avPlayableExtensions.contains(url.pathExtension.lowercased())
     }
 
-    private static let playableExtensions: Set<String> = [
+    private static let avPlayableExtensions: Set<String> = [
         // Audio
         "mp3", "m4a", "m4b", "aac", "alac", "wav", "aiff", "aif", "aifc", "flac",
         // Video

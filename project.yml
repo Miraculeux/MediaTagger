@@ -45,6 +45,21 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: app.mediatagger.MediaTagger
         GENERATE_INFOPLIST_FILE: NO
         CODE_SIGN_ENTITLEMENTS: MediaTagger/MediaTagger.entitlements
+        FRAMEWORK_SEARCH_PATHS:
+          - "$(inherited)"
+          - "$(PROJECT_DIR)/Frameworks"
+        LD_RUNPATH_SEARCH_PATHS:
+          - "$(inherited)"
+          - "@executable_path/../Frameworks"
+    dependencies:
+      # VLCKit is fetched on demand via Scripts/fetch_vlckit.sh and not
+      # committed to the repo (it's ~400 MB extracted). When missing, the
+      # XcodeGen `optional: true` flag silently skips the dependency and
+      # the app falls back to AVFoundation-only playback.
+      - framework: Frameworks/VLCKit.xcframework
+        embed: true
+        codeSign: true
+        optional: true
   MediaTaggerTests:
     type: bundle.unit-test
     platform: macOS
