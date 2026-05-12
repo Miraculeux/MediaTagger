@@ -15,9 +15,22 @@ struct MediaFile: Identifiable, Hashable {
         "mka", "dsf", "dff",
         // Video
         "mp4", "m4v", "mov", "mkv", "webm", "avi",
+        // Images (EXIF/IPTC/TIFF/GPS via ImageIO)
+        "jpg", "jpeg", "tif", "tiff", "heic", "heif", "png", "gif",
+    ]
+
+    /// Extensions handled by the image (EXIF) code path.
+    static let imageExtensions: Set<String> = [
+        "jpg", "jpeg", "tif", "tiff", "heic", "heif", "png", "gif",
     ]
 
     static func isSupported(_ url: URL) -> Bool {
         supportedExtensions.contains(url.pathExtension.lowercased())
     }
+
+    static func isImage(_ url: URL) -> Bool {
+        imageExtensions.contains(url.pathExtension.lowercased())
+    }
+
+    var isImage: Bool { Self.isImage(url) }
 }

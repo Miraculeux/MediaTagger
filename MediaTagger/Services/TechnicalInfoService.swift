@@ -65,6 +65,21 @@ enum TechnicalInfoService {
         return info
     }
 
+    // MARK: Still images (ImageIO)
+
+    static func from(image info: ImageFile.Info, fileSize: Int64?) -> MediaTechnicalInfo {
+        var t = MediaTechnicalInfo()
+        t.isImage = true
+        t.container = info.formatName
+        t.codec = info.formatName
+        t.fileSizeBytes = fileSize
+        t.pixelWidth = info.pixelWidth
+        t.pixelHeight = info.pixelHeight
+        t.bitsPerSample = info.depth
+        t.colorModel = info.colorModel
+        return t
+    }
+
     // MARK: AVAsset fallback (async)
 
     /// Async tech-info extraction for formats with no native parser. Uses

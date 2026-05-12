@@ -46,7 +46,7 @@ struct FileListView: View {
                 ContentUnavailableView(
                     "No media files",
                     systemImage: "play.rectangle",
-                    description: Text("Select a folder containing audio (FLAC, MP3, M4A, AIFF, MKA, OGG, …) or video (MP4, MOV, MKV, …) files.")
+                    description: Text("Select a folder containing audio (FLAC, MP3, M4A, AIFF, MKA, OGG, …), video (MP4, MOV, MKV, …) or image (JPEG, TIFF, HEIC, PNG) files.")
                 )
             }
         }
@@ -73,6 +73,8 @@ struct FileListView: View {
             return "music.note"
         case "mp4", "m4v", "mov", "mkv", "webm", "avi":
             return "film"
+        case "jpg", "jpeg", "tif", "tiff", "heic", "heif", "png", "gif":
+            return "photo"
         default: return "doc"
         }
     }

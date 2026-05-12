@@ -5,18 +5,22 @@ import Foundation
 extension MediaMetadata {
     /// Set or replace the (first) tag with the given key. Pass `nil` value to remove all entries with that key.
     mutating func setTag(_ key: String, _ value: String?) {
-        let upper = key.uppercased()
+        // Image (EXIF/TIFF/...) keys are case-sensitive — preserve the
+        // original camelCase. Audio/video keys (Vorbis / ID3) are
+        // conventionally uppercase.
+        let canonical = key.contains(":") ? key : key.uppercased()
         if let value {
-            if let idx = tags.firstIndex(where: { $0.key.caseInsensitiveCompare(upper) == .orderedSame }) {
+            if let idx = tags.firstIndex(where: { $0.key.caseInsensitiveCompare(canonical) == .orderedSame }) {
+                tags[idx].key = canonical
                 tags[idx].value = value
                 let keepID = tags[idx].id
                 // Drop further duplicates so we end up with exactly one.
-                tags.removeAll(where: { $0.key.caseInsensitiveCompare(upper) == .orderedSame && $0.id != keepID })
+                tags.removeAll(where: { $0.key.caseInsensitiveCompare(canonical) == .orderedSame && $0.id != keepID })
             } else {
-                tags.append(.init(key: upper, value: value))
+                tags.append(.init(key: canonical, value: value))
             }
         } else {
-            tags.removeAll { $0.key.caseInsensitiveCompare(upper) == .orderedSame }
+            tags.removeAll { $0.key.caseInsensitiveCompare(canonical) == .orderedSame }
         }
     }
 }

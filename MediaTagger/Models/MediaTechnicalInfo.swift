@@ -22,4 +22,11 @@ struct MediaTechnicalInfo: Equatable {
     var fileSizeBytes: Int64?
     /// True if the source is DSD (1-bit) instead of PCM.
     var isDSD: Bool = false
+    /// True if the source is a still image (no audio).
+    var isImage: Bool = false
+    /// Image dimensions in pixels (still images only).
+    var pixelWidth: Int?
+    var pixelHeight: Int?
+    /// Image color model (e.g. "RGB", "Gray", "CMYK").
+    var colorModel: String?
 }

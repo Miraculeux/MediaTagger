@@ -23,6 +23,8 @@ struct MetadataService {
             return try readDSF(url)
         case "dff":
             return try readDFF(url)
+        case let ext where MediaFile.imageExtensions.contains(ext):
+            return readImage(url)
         default:     return try readAVAsset(url)
         }
     }
@@ -59,6 +61,12 @@ struct MetadataService {
             return (mediaMetadata(fromID3Decoded: file.decoded()),
                     TechnicalInfoService.finalize(
                         TechnicalInfoService.from(dff: file, fileSize: fileSize)))
+
+        case let ext where MediaFile.imageExtensions.contains(ext):
+            let info = (try? ImageFile.read(url)) ?? ImageFile.Info()
+            return (mediaMetadata(fromImage: info),
+                    TechnicalInfoService.finalize(
+                        TechnicalInfoService.from(image: info, fileSize: fileSize)))
 
         default:
             // Metadata read is sync (already streaming where applicable);
@@ -116,6 +124,8 @@ struct MetadataService {
             try writeDSF(md, to: url)
         case "dff":
             try writeDFF(md, to: url)
+        case let ext where MediaFile.imageExtensions.contains(ext):
+            try writeImage(md, to: url)
         default: throw NSError(
             domain: "MediaTagger", code: 1,
             userInfo: [NSLocalizedDescriptionKey:
@@ -308,6 +318,30 @@ struct MetadataService {
             cover = nil
         }
         try DFFFile.write(url: url, entries: entries, cover: cover)
+    }
+
+    // MARK: - Image (EXIF/TIFF/IPTC/GPS via ImageIO)
+
+    private func readImage(_ url: URL) -> MediaMetadata {
+        let info = (try? ImageFile.read(url)) ?? ImageFile.Info()
+        return mediaMetadata(fromImage: info)
+    }
+
+    private func writeImage(_ md: MediaMetadata, to url: URL) throws {
+        // Drop the synthetic NAME:VALUE entries that have no prefix —
+        // ImageFile.write ignores them, but stripping here keeps the
+        // intent explicit.
+        let entries = md.tags
+            .map { (key: $0.key, value: $0.value) }
+            .filter { $0.key.contains(":") }
+        try ImageFile.write(url: url, entries: entries)
+    }
+
+    private func mediaMetadata(fromImage info: ImageFile.Info) -> MediaMetadata {
+        MediaMetadata(
+            vendor: nil,
+            tags: info.entries.map { MediaMetadata.Tag(key: $0.key, value: $0.value) }
+        )
     }
 
     // MARK: - AVAsset (read-only fallback)

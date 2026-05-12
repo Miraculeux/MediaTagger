@@ -21,21 +21,32 @@ struct MetadataEditorView: View {
 
     @ViewBuilder
     private func editor(_ md: MediaMetadata) -> some View {
+        let isImage = appState.selectedFile?.isImage == true
         VStack(spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     if let file = appState.selectedFile {
-                        PlayerView(url: file.url)
+                        if isImage {
+                            ImagePreview(url: file.url)
+                        } else {
+                            PlayerView(url: file.url)
+                        }
                     }
-                    coverSection(md)
-                    Divider()
+                    if !isImage {
+                        coverSection(md)
+                        Divider()
+                    }
                     if let tech = appState.technicalInfo {
                         TechnicalInfoSection(info: tech)
                         Divider()
                     }
-                    standardFieldsSection
+                    if isImage {
+                        imageStandardFieldsSection
+                    } else {
+                        standardFieldsSection
+                    }
                     Divider()
-                    otherTagsSection(md)
+                    otherTagsSection(md, isImage: isImage)
                 }
                 .padding(16)
             }
@@ -44,14 +55,61 @@ struct MetadataEditorView: View {
         }
     }
 
-    /// Keys already exposed in the Standard Fields section.
+    /// Keys already exposed in the Standard Fields section (audio/video).
     private static let standardKeys: Set<String> = [
         "TITLE", "ARTIST", "ALBUM", "ALBUMARTIST",
         "TRACKNUMBER", "TRACKTOTAL", "DISCNUMBER", "DISCTOTAL",
         "DATE", "GENRE"
     ]
 
-    // MARK: Standard fields
+    /// Keys already exposed in the image standard-fields section.
+    private static let imageStandardKeys: Set<String> = [
+        "IPTC:ObjectName", "IPTC:Caption/Abstract", "IPTC:Byline",
+        "TIFF:Copyright", "IPTC:CopyrightNotice",
+        "TIFF:Software", "TIFF:DateTime",
+        "EXIF:DateTimeOriginal", "TIFF:Make", "TIFF:Model",
+        "EXIF:UserComment", "EXIF:LensModel",
+        "GPS:Latitude", "GPS:LatitudeRef",
+        "GPS:Longitude", "GPS:LongitudeRef",
+    ]
+
+    // MARK: Standard fields (image)
+
+    private var imageStandardFieldsSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("EXIF / IPTC Fields").font(.headline)
+            Grid(alignment: .leading, horizontalSpacing: 8, verticalSpacing: 6) {
+                imgRow("Title",        key: "IPTC:ObjectName")
+                imgRow("Description",  key: "IPTC:Caption/Abstract")
+                imgRow("Artist",       key: "IPTC:Byline")
+                imgRow("Copyright",    key: "TIFF:Copyright")
+                imgRow("Date Taken",   key: "EXIF:DateTimeOriginal",
+                       placeholder: "YYYY:MM:DD HH:MM:SS")
+                imgRow("File Date",    key: "TIFF:DateTime",
+                       placeholder: "YYYY:MM:DD HH:MM:SS")
+                imgRow("Camera Make",  key: "TIFF:Make")
+                imgRow("Camera Model", key: "TIFF:Model")
+                imgRow("Lens",         key: "EXIF:LensModel")
+                imgRow("Software",     key: "TIFF:Software")
+                imgRow("User Comment", key: "EXIF:UserComment")
+                imgRow("GPS Lat",      key: "GPS:Latitude",
+                       placeholder: "decimal degrees")
+                imgRow("GPS Lon",      key: "GPS:Longitude",
+                       placeholder: "decimal degrees")
+            }
+        }
+    }
+
+    private func imgRow(_ label: String, key: String, placeholder: String = "") -> some View {
+        GridRow {
+            Text(label)
+                .foregroundStyle(.secondary)
+                .frame(width: 110, alignment: .trailing)
+            StandardField(key: key, placeholder: placeholder)
+        }
+    }
+
+    // MARK: Standard fields (audio/video)
 
     /// Always-visible editable rows for the most common keys (including TRACKNUMBER /
     /// TRACKTOTAL / DISCNUMBER / DISCTOTAL), independent of whether they exist on the file.
@@ -181,8 +239,10 @@ struct MetadataEditorView: View {
     }
 
     @ViewBuilder
-    private func otherTagsSection(_ md: MediaMetadata) -> some View {
-        let extras = md.tags.filter { !Self.standardKeys.contains($0.key.uppercased()) }
+    private func otherTagsSection(_ md: MediaMetadata, isImage: Bool) -> some View {
+        let excluded = isImage ? Self.imageStandardKeys : Self.standardKeys
+        let extras = md.tags.filter { !excluded.contains($0.key.uppercased())
+                                       && !excluded.contains($0.key) }
         DisclosureGroup(isExpanded: $showOtherTags) {
             VStack(alignment: .leading, spacing: 6) {
                 ForEach(extras) { tag in
@@ -267,7 +327,11 @@ private struct TagRow: View {
     }
 
     private func commit() {
-        appState.updateTag(id: tag.id, key: key.uppercased(), value: value)
+        // Preserve case for prefixed image tags (e.g. "EXIF:DateTimeOriginal")
+        // — ImageIO expects the exact camelCase key. For audio/video tags
+        // (Vorbis comments, ID3) we keep the convention of uppercasing the key.
+        let normalizedKey = key.contains(":") ? key : key.uppercased()
+        appState.updateTag(id: tag.id, key: normalizedKey, value: value)
     }
 }
 
@@ -282,6 +346,9 @@ private struct TechnicalInfoSection: View {
         let bitrate: String?
         let duration: String?
         let fileSize: String?
+        let dimensions: String?
+        let colorModel: String?
+        let isImage: Bool
     }
 
     private let f: Formatted
@@ -295,11 +362,13 @@ private struct TechnicalInfoSection: View {
             Text("Info").font(.headline)
             Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 4) {
                 if let s = f.format     { row("Format",      s) }
-                if let s = f.sampleRate { row("Sample Rate", s) }
+                if let s = f.dimensions { row("Dimensions",  s) }
+                if let s = f.colorModel { row("Color",       s) }
+                if !f.isImage, let s = f.sampleRate { row("Sample Rate", s) }
                 if let s = f.bitDepth   { row("Bit Depth",   s) }
-                if let s = f.channels   { row("Channels",    s) }
-                if let s = f.bitrate    { row("Bitrate",     s) }
-                if let s = f.duration   { row("Duration",    s) }
+                if !f.isImage, let s = f.channels   { row("Channels",    s) }
+                if !f.isImage, let s = f.bitrate    { row("Bitrate",     s) }
+                if !f.isImage, let s = f.duration   { row("Duration",    s) }
                 if let s = f.fileSize   { row("File Size",   s) }
             }
             .font(.callout.monospacedDigit())
@@ -326,8 +395,20 @@ private struct TechnicalInfoSection: View {
             channels:   channelsString(info),
             bitrate:    bitrateString(info),
             duration:   durationString(info),
-            fileSize:   fileSizeString(info)
+            fileSize:   fileSizeString(info),
+            dimensions: dimensionsString(info),
+            colorModel: info.isImage ? info.colorModel : nil,
+            isImage:    info.isImage
         )
+    }
+
+    private static func dimensionsString(_ info: MediaTechnicalInfo) -> String? {
+        guard let w = info.pixelWidth, let h = info.pixelHeight, w > 0, h > 0 else { return nil }
+        let mp = Double(w * h) / 1_000_000
+        if mp >= 0.1 {
+            return String(format: "%d × %d  (%.1f MP)", w, h, mp)
+        }
+        return "\(w) × \(h)"
     }
 
     private static func formatString(_ info: MediaTechnicalInfo) -> String? {
@@ -428,5 +509,31 @@ private struct StandardField: View {
                     appState.setStandardTag(key, newValue)
                 }
             }
+    }
+}
+
+/// Lightweight preview for still images (selected EXIF-capable file).
+private struct ImagePreview: View {
+    let url: URL
+
+    var body: some View {
+        Group {
+            if let img = NSImage(contentsOf: url) {
+                Image(nsImage: img)
+                    .resizable()
+                    .interpolation(.high)
+                    .scaledToFit()
+                    .frame(maxWidth: .infinity, maxHeight: 280)
+            } else {
+                ZStack {
+                    Rectangle().fill(.quaternary)
+                    Image(systemName: "photo")
+                        .font(.system(size: 28))
+                        .foregroundStyle(.secondary)
+                }
+                .frame(height: 200)
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 6))
     }
 }
