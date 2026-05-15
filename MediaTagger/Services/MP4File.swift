@@ -135,9 +135,11 @@ struct MP4File {
 
     fileprivate func writeReplacingMetadata(entries: [(key: String, value: String)],
                                             cover: Cover?) throws {
-        // Read whole file. M4A files are typically tens of MB which fits fine
-        // in memory on a Mac; if this becomes a concern we can stream later.
-        let original = try Data(contentsOf: url)
+        // Memory-map the input so very large containers (multi-GB MP4 video)
+        // don't cause a full-file copy into the resident set just to read the
+        // moov bytes. The kernel pages content in on demand; subdata() and
+        // the rebuild path then allocate only what they need.
+        let original = try Data(contentsOf: url, options: .mappedIfSafe)
 
         guard let moovIdx = topAtoms.firstIndex(where: { $0.type == "moov" }) else {
             throw NSError(domain: "MediaTagger.MP4", code: 1,

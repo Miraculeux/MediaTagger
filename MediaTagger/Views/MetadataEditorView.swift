@@ -7,6 +7,11 @@ struct MetadataEditorView: View {
     @EnvironmentObject var appState: AppState
     @State private var showOtherTags: Bool = false
 
+    /// Decoded cover-art image, cached so view body re-evaluations don't
+    /// re-decode the JPEG/PNG payload on every redraw. Refreshed (off-main)
+    /// whenever `metadata?.coverArt` changes.
+    @State private var coverImage: NSImage?
+
     var body: some View {
         if appState.selectedFile == nil {
             ContentUnavailableView("No file selected",
@@ -36,10 +41,19 @@ struct MetadataEditorView: View {
                         coverSection(md)
                         Divider()
                     }
-                    if let tech = appState.technicalInfo {
-                        TechnicalInfoSection(info: tech)
-                        Divider()
+                    // Reserve the Info section's slot even before the tech
+                    // probe finishes so the rest of the editor doesn't jump
+                    // up by ~140pt and then snap back when the data arrives.
+                    // The placeholder mirrors the real section's headline +
+                    // a couple of skeleton rows so the layout is stable.
+                    Group {
+                        if let tech = appState.technicalInfo {
+                            TechnicalInfoSection(info: tech)
+                        } else {
+                            TechnicalInfoPlaceholder(isImage: isImage)
+                        }
                     }
+                    Divider()
                     if isImage {
                         imageStandardFieldsSection
                     } else {
@@ -162,7 +176,7 @@ struct MetadataEditorView: View {
     private func coverSection(_ md: MediaMetadata) -> some View {
         HStack(alignment: .top, spacing: 12) {
             Group {
-                if let data = md.coverArt, let img = NSImage(data: data) {
+                if let img = coverImage {
                     Image(nsImage: img)
                         .resizable()
                         .interpolation(.high)
@@ -178,6 +192,27 @@ struct MetadataEditorView: View {
             }
             .frame(width: 120, height: 120)
             .clipShape(RoundedRectangle(cornerRadius: 6))
+            // Decode the cover off-main and cache the resulting NSImage so
+            // unrelated state changes (typing in a TextField, etc.) don't
+            // force NSImage(data:) to re-decode multi-MB cover art on each
+            // body re-evaluation.
+            //
+            // The id intentionally avoids the raw `Data` payload — feeding
+            // multi-MB Data to `.task(id:)` makes SwiftUI run an O(n)
+            // byte-by-byte `==` on every view update, which was slower than
+            // the decode we were trying to skip. The (file URL, byte count)
+            // pair is a cheap proxy that changes whenever the user picks a
+            // new file or replaces/removes the cover.
+            .task(id: CoverID(url: appState.selectedFile?.url, byteCount: md.coverArt?.count)) {
+                guard let data = md.coverArt else {
+                    coverImage = nil
+                    return
+                }
+                let img = await Task.detached(priority: .userInitiated) {
+                    NSImage(data: data)
+                }.value
+                coverImage = img
+            }
 
             VStack(alignment: .leading, spacing: 6) {
                 Text("Cover Art").font(.headline)
@@ -244,7 +279,10 @@ struct MetadataEditorView: View {
         let extras = md.tags.filter { !excluded.contains($0.key.uppercased())
                                        && !excluded.contains($0.key) }
         DisclosureGroup(isExpanded: $showOtherTags) {
-            VStack(alignment: .leading, spacing: 6) {
+            // LazyVStack keeps row instantiation/layout proportional to what's
+            // visible inside the surrounding ScrollView — important for image
+            // files that can carry hundreds of EXIF/IPTC entries.
+            LazyVStack(alignment: .leading, spacing: 6) {
                 ForEach(extras) { tag in
                     TagRow(tag: tag)
                 }
@@ -294,6 +332,18 @@ struct MetadataEditorView: View {
         }
         .padding(10)
     }
+}
+
+/// Cheap identity for the cover-art `.task(id:)` modifier. Comparing the raw
+/// `Data` payload would force SwiftUI to do an O(n) byte compare on every
+/// view update; comparing the (URL, byteCount) pair runs in O(1) and still
+/// changes whenever the user picks a new file or replaces/removes the cover
+/// (a different image will essentially always have a different byte count;
+/// the rare same-size edit is acceptable to miss because we keep showing the
+/// previously decoded image).
+private struct CoverID: Equatable {
+    let url: URL?
+    let byteCount: Int?
 }
 
 private struct TagRow: View {
@@ -475,6 +525,40 @@ private struct TechnicalInfoSection: View {
     }
 }
 
+/// Reserves the same vertical space as `TechnicalInfoSection` while the real
+/// info is being probed off-main, so switching files (especially via ↑/↓ in
+/// the file list) doesn't make the rest of the editor jump up and then snap
+/// back down once the data lands. Rendered with the secondary text colour
+/// alone — no animated spinner, which would itself draw the eye.
+private struct TechnicalInfoPlaceholder: View {
+    let isImage: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Info").font(.headline)
+            Grid(alignment: .leading, horizontalSpacing: 12, verticalSpacing: 4) {
+                ForEach(0..<rowCount, id: \.self) { _ in
+                    GridRow {
+                        Text("")
+                            .frame(width: 100, alignment: .trailing)
+                        Text(" ")
+                    }
+                }
+            }
+            .font(.callout.monospacedDigit())
+        }
+        // The real section's height varies a little per format; pick a value
+        // that matches the common cases (4–5 rows) so the visual delta when
+        // the real section swaps in is minimal.
+        .frame(minHeight: minHeight, alignment: .topLeading)
+        .opacity(0)   // invisible — purely a layout placeholder.
+        .accessibilityHidden(true)
+    }
+
+    private var rowCount: Int { isImage ? 4 : 6 }
+    private var minHeight: CGFloat { isImage ? 110 : 150 }
+}
+
 /// Editable field bound to a single standard tag key on `AppState.metadata`.
 /// Reads the current value when the selected file changes; writes through
 /// `setStandardTag` (empty string removes the tag).
@@ -513,12 +597,21 @@ private struct StandardField: View {
 }
 
 /// Lightweight preview for still images (selected EXIF-capable file).
+///
+/// Decoding is done off-main (large RAW/HEIC/PNG files can take 50–300 ms
+/// to decode on the main thread, which manifests as a frozen right pane
+/// every time the user arrows past an image in the file list). The previous
+/// image is kept on screen until the new one is ready, mirroring the
+/// "no spinner flash" approach used for tag metadata.
 private struct ImagePreview: View {
     let url: URL
 
+    @State private var image: NSImage?
+    @State private var loadedURL: URL?
+
     var body: some View {
         Group {
-            if let img = NSImage(contentsOf: url) {
+            if let img = image {
                 Image(nsImage: img)
                     .resizable()
                     .interpolation(.high)
@@ -535,5 +628,22 @@ private struct ImagePreview: View {
             }
         }
         .clipShape(RoundedRectangle(cornerRadius: 6))
+        // `.task(id: url)` cancels the previous decode if the user keeps
+        // arrowing through images faster than they can be loaded.
+        .task(id: url) {
+            // Skip the redecode if we already have this URL cached (e.g. the
+            // user clicked the same row twice).
+            if loadedURL == url, image != nil { return }
+            let decoded = await Task.detached(priority: .userInitiated) {
+                NSImage(contentsOf: url)
+            }.value
+            if Task.isCancelled { return }
+            // Only swap if we're still the latest request. SwiftUI cancels
+            // the prior `.task` when `url` changes so this guard is mostly
+            // belt-and-braces — but it costs nothing.
+            guard !Task.isCancelled else { return }
+            image = decoded
+            loadedURL = url
+        }
     }
 }

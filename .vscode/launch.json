@@ -2,10 +2,18 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Run MediaTagger (open .app)",
-            "type": "node-terminal",
+            // Launches the app bundle directly (not via `open`), so VS Code's
+            // process tree maps 1:1 to the running app — closing the window
+            // ends the debug session immediately. Requires the Debug build to
+            // disable Xcode's debug-dylib stub (see project.yml:
+            // ENABLE_DEBUG_DYLIB_SUPPORT=NO, ENABLE_PREVIEWS=NO).
+            "name": "Run MediaTagger",
+            "type": "lldb",
             "request": "launch",
-            "command": "open -W -n ${workspaceFolder}/build/Build/Products/Debug/MediaTagger.app",
+            "program": "${workspaceFolder}/build/Build/Products/Debug/MediaTagger.app/Contents/MacOS/MediaTagger",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "terminal": "integrated",
             "preLaunchTask": "MediaTagger: Build (Debug)"
         },
         {

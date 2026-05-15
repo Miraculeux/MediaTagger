@@ -32,6 +32,11 @@ struct BatchEditorView: View {
     /// the "start typing -> auto-enable checkbox" behavior in `toggledField`.
     @State private var isPrefilling = false
 
+    /// In-flight prefill task. Cancelled if the selection changes again before
+    /// the previous read finishes, so we don't overwrite freshly-typed user
+    /// input with stale tag values from a no-longer-selected file.
+    @State private var prefillTask: Task<Void, Never>?
+
     var body: some View {
         VStack(spacing: 0) {
             header
@@ -53,31 +58,52 @@ struct BatchEditorView: View {
         }
         .onAppear { prefillFromFirstFile() }
         .onChange(of: appState.selectedFileIDs) { _, _ in prefillFromFirstFile() }
+        .onDisappear {
+            // Don't keep parsing the previously-selected first file (which
+            // can be tens of MB) once the user has dismissed this editor.
+            prefillTask?.cancel()
+            prefillTask = nil
+        }
     }
 
     /// Pre-populate field text (and cover preview) using the first selected file's
     /// existing tags so the user can edit common values starting from a real baseline.
     /// Toggles are left OFF — user must explicitly opt-in to apply each one.
+    ///
+    /// The metadata read happens off-main so a slow first file (e.g. a large
+    /// FLAC or Matroska container) can't freeze the editor when the user
+    /// changes selection.
     private func prefillFromFirstFile() {
-        guard let first = appState.selectedFiles.first,
-              let md = try? MetadataService().read(first.url) else { return }
-        isPrefilling = true
-        defer {
-            // Drop the suppression flag on the next runloop tick, after the
-            // text-binding onChange handlers have fired.
-            DispatchQueue.main.async { isPrefilling = false }
-        }
-        if let v = md.first("ALBUM")       { album = v }
-        if let v = md.first("ALBUMARTIST") { albumArtist = v }
-        if let v = md.first("ARTIST")      { artist = v }
-        if let v = md.first("DATE")        { date = v }
-        if let v = md.first("GENRE")       { genre = v }
-        if let v = md.first("DISCNUMBER")  { discNumber = v }
-        if let v = md.first("DISCTOTAL")   { discTotal = v }
-        if let data = md.coverArt {
-            coverData = data
-            coverMime = md.coverMimeType
-            clearCover = false
+        prefillTask?.cancel()
+        guard let first = appState.selectedFiles.first else { return }
+        let url = first.url
+        prefillTask = Task { @MainActor in
+            let md: MediaMetadata? = await Task.detached(priority: .userInitiated) {
+                try? MetadataService().read(url)
+            }.value
+            if Task.isCancelled { return }
+            guard let md else { return }
+            // The user may have changed (or cleared) selection while we were
+            // reading; bail out if the first file is no longer the one we read.
+            guard appState.selectedFiles.first?.url == url else { return }
+            isPrefilling = true
+            defer {
+                // Drop the suppression flag on the next runloop tick, after the
+                // text-binding onChange handlers have fired.
+                DispatchQueue.main.async { isPrefilling = false }
+            }
+            if let v = md.first("ALBUM")       { album = v }
+            if let v = md.first("ALBUMARTIST") { albumArtist = v }
+            if let v = md.first("ARTIST")      { artist = v }
+            if let v = md.first("DATE")        { date = v }
+            if let v = md.first("GENRE")       { genre = v }
+            if let v = md.first("DISCNUMBER")  { discNumber = v }
+            if let v = md.first("DISCTOTAL")   { discTotal = v }
+            if let data = md.coverArt {
+                coverData = data
+                coverMime = md.coverMimeType
+                clearCover = false
+            }
         }
     }
 
@@ -114,7 +140,7 @@ struct BatchEditorView: View {
         let sample = appState.selectedFiles.prefix(3)
         return VStack(alignment: .leading, spacing: 2) {
             Text("Preview").font(.caption).foregroundStyle(.secondary)
-            ForEach(Array(sample), id: \.id) { f in
+            ForEach(sample, id: \.id) { f in
                 HStack {
                     Text(f.name).font(.caption.monospaced()).foregroundStyle(.secondary).lineLimit(1)
                     Image(systemName: "arrow.right").font(.caption2).foregroundStyle(.secondary)

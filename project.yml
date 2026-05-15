@@ -45,6 +45,17 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: app.mediatagger.MediaTagger
         GENERATE_INFOPLIST_FILE: NO
         CODE_SIGN_ENTITLEMENTS: MediaTagger/MediaTagger.entitlements
+        # Disable Xcode 16/17 "debug dylib" + Previews stub executor so the
+        # Debug build produces a single regular Mach-O at
+        #   MediaTagger.app/Contents/MacOS/MediaTagger
+        # Without this the executable becomes a ~2 MB stub launched via a
+        # host process; LLDB / `open -W` then can't tell when the app has
+        # actually exited, and VS Code debug sessions appear to hang after
+        # the window closes.
+        ENABLE_DEBUG_DYLIB: NO
+        ENABLE_DEBUG_DYLIB_SUPPORT: NO
+        ENABLE_PREVIEWS: NO
+        ENABLE_XOJIT_PREVIEWS: NO
         FRAMEWORK_SEARCH_PATHS:
           - "$(inherited)"
           - "$(PROJECT_DIR)/Frameworks"

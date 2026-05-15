@@ -12,6 +12,12 @@ MediaTagger.xcodeproj/
 # VS Code build output (from .vscode/tasks.json)
 /build/
 
+# Release build output (manual `xcodebuild -configuration Release …` invocations)
+/build-release/
+
+# LLVM coverage raw output, dropped by the test runner / instrumented binaries.
+*.profraw
+
 # Intermediate iconset (re-created by Scripts/generate_icon.swift)
 MediaTagger/Resources/AppIcon.iconset/
 
