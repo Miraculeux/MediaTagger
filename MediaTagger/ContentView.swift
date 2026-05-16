@@ -28,7 +28,7 @@ struct ContentView: View {
         }
         .navigationTitle(appState.rootURL?.lastPathComponent ?? "Media Tagger")
         .toolbar {
-            ToolbarItem(placement: .primaryAction) {
+            ToolbarItem(placement: .navigation) {
                 Button {
                     appState.pickRootFolder()
                 } label: {
