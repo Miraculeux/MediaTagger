@@ -30,6 +30,17 @@ struct FileListView: View {
                     .lineLimit(1)
             }
         }
+        .contextMenu(forSelectionType: URL.self) { ids in
+            // Right-click on a row: ensure the clicked row participates in
+            // the action even if it wasn't already selected.
+            let targets = ids.isEmpty ? appState.selectedFileIDs : ids
+            Button("Reveal in Finder") { revealInFinder(targets) }
+                .disabled(targets.isEmpty)
+            Button("Reveal in Seeker") { revealInSeeker(targets) }
+                .disabled(targets.isEmpty)
+            Divider()
+            Button("Refresh") { appState.refreshFiles() }
+        }
         .background {
             // Hidden ⌘C handler: copies the selected file's title (or its
             // filename without extension if no title is known). Disabled when
@@ -52,9 +63,39 @@ struct FileListView: View {
         }
     }
 
+    /// Show the given file URLs in Finder. When multiple URLs share a parent
+    /// (the common case) Finder opens one window with all of them highlighted.
+    private func revealInFinder(_ ids: Set<URL>) {
+        let urls = appState.files
+            .filter { ids.contains($0.id) }
+            .map(\.url)
+        guard !urls.isEmpty else { return }
+        NSWorkspace.shared.activateFileViewerSelecting(urls)
+    }
+
+    /// Open the first selected file in the Seeker app via its `seeker://reveal`
+    /// URL scheme. Seeker can only focus one path at a time so we use the
+    /// first selection if multiple rows are selected.
+    private func revealInSeeker(_ ids: Set<URL>) {
+        guard let url = appState.files.first(where: { ids.contains($0.id) })?.url else { return }
+        var comps = URLComponents()
+        comps.scheme = "seeker"
+        comps.host = "reveal"
+        comps.queryItems = [URLQueryItem(name: "path", value: url.path)]
+        guard let target = comps.url else { return }
+        NSWorkspace.shared.open(target)
+    }
+
     /// Copy the first selected file's title to the clipboard. Falls back to
     /// the filename without its extension when no title metadata is present.
     private func copySelectedTitle() {
+        // Try the responder chain first: if a text field / text view has
+        // focus, its own copy: handler runs and we're done. sendAction
+        // returns false only when nothing in the chain implements copy:,
+        // in which case we fall through to the file-list copy below.
+        if NSApp.sendAction(#selector(NSText.copy(_:)), to: nil, from: nil) {
+            return
+        }
         guard let file = appState.files.first(where: {
             appState.selectedFileIDs.contains($0.id)
         }) else { return }

@@ -129,6 +129,16 @@ struct BatchEditorView: View {
                     Toggle("Replace underscores with spaces", isOn: $cleanup.underscoresToSpaces)
                     Toggle("Collapse whitespace", isOn: $cleanup.collapseWhitespace)
                     Toggle("Trim", isOn: $cleanup.trim)
+                    HStack(spacing: 6) {
+                        Text("Replace").foregroundStyle(.secondary)
+                        TextField("find", text: $cleanup.replaceFind)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(maxWidth: 160)
+                        Text("with").foregroundStyle(.secondary)
+                        TextField("replacement", text: $cleanup.replaceWith)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(maxWidth: 160)
+                    }
                 }
                 .padding(.leading, 20)
                 preview
@@ -221,6 +231,9 @@ struct BatchEditorView: View {
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.jpeg, .png]
         panel.allowsMultipleSelection = false
+        if let firstFile = appState.selectedFiles.first {
+            panel.directoryURL = firstFile.url.deletingLastPathComponent()
+        }
         if panel.runModal() == .OK,
            let url = panel.url,
            let d = try? Data(contentsOf: url) {

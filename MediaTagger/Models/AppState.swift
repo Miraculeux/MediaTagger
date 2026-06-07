@@ -130,6 +130,16 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// Re-scan the current folder, preserving the user's selection where
+    /// possible. Used by the file-list refresh button / context menu.
+    func refreshFiles() {
+        guard let folder = selectedFolder ?? rootURL else { return }
+        let previousSelection = selectedFileIDs
+        loadFiles(in: folder)
+        let still = previousSelection.intersection(Set(files.map(\.id)))
+        if !still.isEmpty { setSelection(still) }
+    }
+
     // MARK: - Selection / metadata
 
     var selectedFiles: [MediaFile] {

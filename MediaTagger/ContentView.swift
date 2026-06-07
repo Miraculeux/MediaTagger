@@ -35,6 +35,16 @@ struct ContentView: View {
                     Label("Choose Root", systemImage: "folder.badge.plus")
                 }
             }
+            ToolbarItem(placement: .navigation) {
+                Button {
+                    appState.refreshFiles()
+                } label: {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                }
+                .help("Refresh file list (⌘R)")
+                .keyboardShortcut("r", modifiers: .command)
+                .disabled(appState.selectedFolder == nil && appState.rootURL == nil)
+            }
         }
     }
 }

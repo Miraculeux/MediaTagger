@@ -236,6 +236,9 @@ struct MetadataEditorView: View {
         panel.allowedContentTypes = [.jpeg, .png]
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
+        if let fileURL = appState.selectedFile?.url {
+            panel.directoryURL = fileURL.deletingLastPathComponent()
+        }
         if panel.runModal() == .OK, let url = panel.url, let data = try? Data(contentsOf: url) {
             var m = appState.metadata ?? MediaMetadata()
             m.coverArt = data

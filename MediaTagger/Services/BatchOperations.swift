@@ -32,6 +32,12 @@ struct FilenameCleanupOptions: Equatable {
     var underscoresToSpaces: Bool = true
     var collapseWhitespace: Bool = true
     var trim: Bool = true
+    /// If non-empty, every occurrence of `replaceFind` in the filename is
+    /// substituted with `replaceWith` BEFORE the other cleanup steps run.
+    /// Lets the user strip publisher tags like "[Hi-Res]" or "(Remastered)"
+    /// from a batch of filenames without touching the rest of the title.
+    var replaceFind: String = ""
+    var replaceWith: String = ""
 }
 
 enum FilenameCleaner {
@@ -39,6 +45,9 @@ enum FilenameCleaner {
     static func title(from filename: String, options: FilenameCleanupOptions = .init()) -> String {
         var s = (filename as NSString).deletingPathExtension
 
+        if !options.replaceFind.isEmpty {
+            s = s.replacingOccurrences(of: options.replaceFind, with: options.replaceWith)
+        }
         if options.stripLeadingTrackNumber {
             // Match: optional disc-track ("1-02", "01.02"), or simple "01", followed by separator.
             // Examples removed: "01 ", "01-", "01.", "1.02 ", "12 - "
