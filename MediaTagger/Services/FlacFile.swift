@@ -194,45 +194,42 @@ struct FlacFile {
     }
 
     /// Writes the file in-place. If the new metadata area fits within the
-    /// existing one (using padding), we patch in place; otherwise we rewrite.
+    /// existing one (using padding), we patch the metadata bytes directly
+    /// via `FileHandle.seek` so multi-GB FLACs don't get rewritten just to
+    /// retitle a track. Otherwise we stream the audio frames into a new
+    /// temp file alongside the new header and atomically swap it in.
     func write() throws {
-        let original = try Data(contentsOf: url, options: .mappedIfSafe)
         let prefixLen = id3Prefix.count
         let originalMetadataLen = audioOffset - prefixLen - 4 // excluding ID3v2 prefix and "fLaC"
 
-        // Try to fit into existing metadata area.
+        // Try to fit into existing metadata area: patch bytes in place.
         let inPlace = encodeMetadataArea(targetSize: originalMetadataLen)
         if inPlace.count == originalMetadataLen {
-            var out = Data()
-            out.reserveCapacity(original.count)
-            if prefixLen > 0 { out.append(id3Prefix) }
-            out.append(contentsOf: [0x66, 0x4C, 0x61, 0x43])
-            out.append(inPlace)
-            out.append(original.subdata(in: audioOffset..<original.count))
-            try atomicWrite(out, to: url)
+            let h = try FileHandle(forUpdating: url)
+            defer { try? h.close() }
+            try h.seek(toOffset: UInt64(prefixLen + 4))
+            try h.write(contentsOf: inPlace)
             return
         }
 
-        // Otherwise rewrite with default padding.
-        var out = Data()
+        // Otherwise rewrite: stream audio frames into a temp file.
         let area = encodeMetadataArea()
-        out.reserveCapacity(prefixLen + 4 + area.count + (original.count - audioOffset))
-        if prefixLen > 0 { out.append(id3Prefix) }
-        out.append(contentsOf: [0x66, 0x4C, 0x61, 0x43])
-        out.append(area)
-        out.append(original.subdata(in: audioOffset..<original.count))
-        try atomicWrite(out, to: url)
-    }
+        let fileSize = IOStreaming.fileSize(of: url)
+        let audioBytes = fileSize > UInt64(audioOffset) ? fileSize - UInt64(audioOffset) : 0
 
-    private func atomicWrite(_ data: Data, to url: URL) throws {
-        let tmp = url.deletingLastPathComponent()
-            .appendingPathComponent(".\(url.lastPathComponent).tmp-\(UUID().uuidString)")
-        do {
-            try data.write(to: tmp, options: .atomic)
-            _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
-        } catch {
-            try? FileManager.default.removeItem(at: tmp)
-            throw FlacError.writeFailed(error.localizedDescription)
+        try IOStreaming.writeAtomically(to: url) { tmpURL in
+            let dest = try FileHandle(forWritingTo: tmpURL)
+            defer { try? dest.close() }
+            if prefixLen > 0 { try dest.write(contentsOf: id3Prefix) }
+            try dest.write(contentsOf: Data([0x66, 0x4C, 0x61, 0x43]))
+            try dest.write(contentsOf: area)
+
+            let src = try FileHandle(forReadingFrom: url)
+            defer { try? src.close() }
+            try src.seek(toOffset: UInt64(audioOffset))
+            if audioBytes > 0 {
+                try IOStreaming.stream(from: src, into: dest, byteCount: audioBytes)
+            }
         }
     }
 }

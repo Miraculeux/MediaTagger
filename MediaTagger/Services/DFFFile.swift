@@ -125,50 +125,73 @@ struct DFFFile {
     /// Replace (or insert) the "ID3 " chunk inside `url` and rewrite the file
     /// atomically. All other top-level chunks (DSD audio, FVER, PROP, DIIN…)
     /// are preserved verbatim, in their original order.
+    ///
+    /// Streams non-ID3 chunks through a `FileHandle` instead of buffering
+    /// them in memory. A multi-GB DSD file edited for tags only does one
+    /// sequential pass plus a small ID3 write.
     static func write(url: URL,
                       entries: [(key: String, value: String)],
                       cover: (data: Data, mime: String)?) throws {
-        let original = try Data(contentsOf: url, options: .mappedIfSafe)
-        guard original.count >= 16,
-              original[0] == 0x46, original[1] == 0x52,
-              original[2] == 0x4D, original[3] == 0x38
+        // Pass 1: read header + walk chunk headers to build the keep-list.
+        let src = try FileHandle(forReadingFrom: url)
+        defer { try? src.close() }
+
+        let head = try src.read(upToCount: 16) ?? Data()
+        guard head.count >= 16,
+              head[0] == 0x46, head[1] == 0x52,
+              head[2] == 0x4D, head[3] == 0x38
         else { throw DFFError.notDFF }
-        let formType = original.subdata(in: 12..<16)
+        let formType = head.subdata(in: 12..<16)
 
-        let newID3 = encodedID3(entries: entries, cover: cover)
+        let totalFileSize = IOStreaming.fileSize(of: url)
 
-        // Rebuild chunks: keep every non-ID3 chunk's bytes verbatim, then
-        // append a fresh ID3 chunk last.
-        var chunksOut = Data()
-        var p = 16
-        while p + 12 <= original.count {
-            let id = String(data: original.subdata(in: p..<p+4), encoding: .ascii) ?? ""
-            let size = Int(beU64(original, p + 4))
+        struct ChunkRange { let offset: UInt64; let length: UInt64 }
+        var keepRanges: [ChunkRange] = []
+        var keepBytes: UInt64 = 0
+        var p: UInt64 = 16
+
+        while p + 12 <= totalFileSize {
+            try src.seek(toOffset: p)
+            let header = try src.read(upToCount: 12) ?? Data()
+            if header.count < 12 { break }
+            let id = String(data: header.prefix(4), encoding: .ascii) ?? ""
+            let size = beU64(header, 4)
             let payloadEnd = p + 12 + size
-            guard payloadEnd <= original.count else { break }
+            guard payloadEnd <= totalFileSize else { break }
             let chunkEnd = payloadEnd + (size & 1)
+            let actualEnd = min(chunkEnd, totalFileSize)
             if id != "ID3 " {
-                chunksOut.append(original.subdata(in: p..<min(chunkEnd, original.count)))
+                let length = actualEnd - p
+                keepRanges.append(ChunkRange(offset: p, length: length))
+                keepBytes += length
             }
             p = chunkEnd
         }
 
-        chunksOut.append(Data("ID3 ".utf8))
-        chunksOut.append(beU64Bytes(UInt64(newID3.count)))
-        chunksOut.append(newID3)
-        if newID3.count & 1 == 1 { chunksOut.append(0) }
+        let newID3 = encodedID3(entries: entries, cover: cover)
+        let id3PaddingByte: UInt64 = (UInt64(newID3.count) & 1) == 1 ? 1 : 0
+        let newID3Total: UInt64 = 12 + UInt64(newID3.count) + id3PaddingByte
+        let formPayloadSize: UInt64 = 4 + keepBytes + newID3Total
 
-        // FRM8 size = 4 (form type) + chunksOut.count.
-        var out = Data()
-        out.append(Data("FRM8".utf8))
-        out.append(beU64Bytes(UInt64(4 + chunksOut.count)))
-        out.append(formType)                                         // "DSD "
-        out.append(chunksOut)
+        // Pass 2: stream output.
+        try IOStreaming.writeAtomically(to: url) { tmpURL in
+            let dest = try FileHandle(forWritingTo: tmpURL)
+            defer { try? dest.close() }
 
-        let tmp = url.deletingLastPathComponent()
-            .appendingPathComponent(".\(url.lastPathComponent).tmp-\(UUID().uuidString)")
-        try out.write(to: tmp, options: .atomic)
-        _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
+            try dest.write(contentsOf: Data("FRM8".utf8))
+            try dest.write(contentsOf: beU64Bytes(formPayloadSize))
+            try dest.write(contentsOf: formType)
+
+            for range in keepRanges {
+                try src.seek(toOffset: range.offset)
+                try IOStreaming.stream(from: src, into: dest, byteCount: range.length)
+            }
+
+            try dest.write(contentsOf: Data("ID3 ".utf8))
+            try dest.write(contentsOf: beU64Bytes(UInt64(newID3.count)))
+            try dest.write(contentsOf: newID3)
+            if id3PaddingByte == 1 { try dest.write(contentsOf: Data([0])) }
+        }
     }
 
     private static func encodedID3(entries: [(key: String, value: String)],

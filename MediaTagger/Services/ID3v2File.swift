@@ -156,14 +156,16 @@ struct ID3v2File {
     /// Replaces ID3v2 frames with ones derived from `entries` and `cover`,
     /// then writes the file back. `entries` are Vorbis-style keys; unknown
     /// keys become TXXX user-defined frames.
+    ///
+    /// Streams the audio body through a `FileHandle` instead of loading the
+    /// whole file into memory, so retagging a 500 MB MP3 only does ~100 KB
+    /// of metadata IO plus one sequential audio copy.
     static func write(
         url: URL,
         entries: [(key: String, value: String)],
         cover: (data: Data, mime: String)?
     ) throws {
-        // Read existing body so audio + ID3v1 are preserved.
-        let existing = try ID3v2File.read(url)
-        let body = existing.body
+        let bodyOffset = try probeBodyOffset(url)
 
         // Build frames.
         var newFrames: [ID3Frame] = []
@@ -208,12 +210,47 @@ struct ID3v2File {
         }
 
         let tag = encodeTag(frames: newFrames, padding: 1024)
-        var out = Data()
-        out.reserveCapacity(tag.count + body.count)
-        out.append(tag)
-        out.append(body)
 
-        try atomicWrite(out, to: url)
+        let totalSize = IOStreaming.fileSize(of: url)
+        let bodyBytes = totalSize > UInt64(bodyOffset) ? totalSize - UInt64(bodyOffset) : 0
+
+        do {
+            try IOStreaming.writeAtomically(to: url) { tmpURL in
+                let dest = try FileHandle(forWritingTo: tmpURL)
+                defer { try? dest.close() }
+                try dest.write(contentsOf: tag)
+
+                if bodyBytes > 0 {
+                    let src = try FileHandle(forReadingFrom: url)
+                    defer { try? src.close() }
+                    try src.seek(toOffset: UInt64(bodyOffset))
+                    try IOStreaming.stream(from: src, into: dest, byteCount: bodyBytes)
+                }
+            }
+        } catch {
+            throw ID3Error.writeFailed(error.localizedDescription)
+        }
+    }
+
+    /// Returns the byte offset where the audio body begins, by reading only
+    /// the 10-byte ID3v2 header (if any). For files without an ID3v2 prefix
+    /// the body starts at offset 0.
+    private static func probeBodyOffset(_ url: URL) throws -> Int {
+        let h = try FileHandle(forReadingFrom: url)
+        defer { try? h.close() }
+        let header = try h.read(upToCount: 10) ?? Data()
+        guard header.count >= 10,
+              header[0] == 0x49, header[1] == 0x44, header[2] == 0x33
+        else { return 0 }
+        let major = header[3]
+        let flags = header[5]
+        let tagSize = Int(header[6] & 0x7F) << 21
+            | Int(header[7] & 0x7F) << 14
+            | Int(header[8] & 0x7F) << 7
+            | Int(header[9] & 0x7F)
+        // Bit 4 of flags indicates a 10-byte footer in ID3v2.4.
+        let footer = (major >= 4 && (flags & 0x10) != 0) ? 10 : 0
+        return 10 + tagSize + footer
     }
 
     /// Encodes an ID3v2.3 tag (header + frames + padding).
@@ -235,18 +272,6 @@ struct ID3v2File {
         out.append(framesData)
         out.append(Data(count: padding))
         return out
-    }
-
-    private static func atomicWrite(_ data: Data, to url: URL) throws {
-        let tmp = url.deletingLastPathComponent()
-            .appendingPathComponent(".\(url.lastPathComponent).tmp-\(UUID().uuidString)")
-        do {
-            try data.write(to: tmp, options: .atomic)
-            _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
-        } catch {
-            try? FileManager.default.removeItem(at: tmp)
-            throw ID3Error.writeFailed(error.localizedDescription)
-        }
     }
 }
 
