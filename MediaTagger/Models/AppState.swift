@@ -43,11 +43,20 @@ final class AppState: ObservableObject {
     /// the previous folder's files after the user navigates away.
     private var titleLoadTask: Task<Void, Never>?
 
+    /// Generation token for background title scans. Incremented whenever the
+    /// folder changes so late results from an old scan are ignored.
+    private var titleLoadGeneration: UInt64 = 0
+
     /// Pending "commit the new selection" task. Held so that fast keyboard
     /// navigation (holding ↓ in the file list) only triggers PlayerView /
     /// cover decode / metadata read for the file the user actually lands on,
     /// not every intermediate file the cursor passed over.
     private var commitSelectionTask: Task<Void, Never>?
+
+    /// In-flight metadata read for the currently committed single selection.
+    /// Cancelled whenever the folder/selection changes so stale reads don't
+    /// continue consuming IO after the user navigates away.
+    private var metadataLoadTask: Task<Void, Never>?
 
     /// How long to wait after a selection change before committing it. Below
     /// the perceptual threshold for a single click but long enough to coalesce
@@ -85,6 +94,8 @@ final class AppState: ObservableObject {
 
     func loadFiles(in folder: URL) {
         selectedFolder = folder
+        titleLoadGeneration &+= 1
+        let scanToken = titleLoadGeneration
         selectedFile = nil
         selectedFileIDs = []
         metadata = nil
@@ -99,6 +110,8 @@ final class AppState: ObservableObject {
         // so it can't fire after the new file list has replaced `files`.
         commitSelectionTask?.cancel()
         commitSelectionTask = nil
+        metadataLoadTask?.cancel()
+        metadataLoadTask = nil
         do {
             let contents = try FileManager.default.contentsOfDirectory(
                 at: folder,
@@ -110,17 +123,21 @@ final class AppState: ObservableObject {
                 .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
             files = mediaURLs.map { MediaFile(id: $0) }
             // lazily load titles in background
-            titleLoadTask = Task.detached { [weak self, files = files] in
+            titleLoadTask = Task.detached { [weak self, files = files, scanToken] in
                 let service = MetadataService()
                 for f in files {
                     if Task.isCancelled { return }
                     guard let md = try? service.read(f.url) else { continue }
+                    if Task.isCancelled { return }
                     let title = md.title
                     let track = md.trackDisplay
                     await MainActor.run {
-                        guard !Task.isCancelled else { return }
-                        if let title { self?.titles[f.url] = title }
-                        if let track { self?.tracks[f.url] = track }
+                        guard !Task.isCancelled,
+                              let self,
+                              self.titleLoadGeneration == scanToken
+                        else { return }
+                        if let title { self.titles[f.url] = title }
+                        if let track { self.tracks[f.url] = track }
                     }
                 }
             }
@@ -172,6 +189,8 @@ final class AppState: ObservableObject {
             // Multi-select / clear: commit immediately. There's no expensive
             // per-file UI to thrash here — the batch editor doesn't reload
             // anything when individual rows toggle in/out of the selection.
+            metadataLoadTask?.cancel()
+            metadataLoadTask = nil
             loadGeneration &+= 1
             selectedFile = nil
             metadata = nil
@@ -184,6 +203,8 @@ final class AppState: ObservableObject {
     /// read whose result is gated by `loadGeneration` so a later selection
     /// change wins if this read takes a while.
     private func commitSingleSelection(_ file: MediaFile) {
+        metadataLoadTask?.cancel()
+        metadataLoadTask = nil
         selectedFile = file
         // Don't clear `metadata` here — keeping the previous tags on
         // screen while the new file loads avoids a "spinner flash" on
@@ -197,10 +218,12 @@ final class AppState: ObservableObject {
         // Show cached tech info immediately if we've seen this file in
         // this session; otherwise clear stale tech from the previous file.
         technicalInfo = techInfoCache[url]
-        Task.detached(priority: .userInitiated) { [weak self] in
+        metadataLoadTask = Task.detached(priority: .userInitiated) { [weak self] in
+            if Task.isCancelled { return }
             let result: Result<(MediaMetadata, MediaTechnicalInfo), Error>
             do { result = .success(try await service.readAll(url)) }
             catch { result = .failure(error) }
+            if Task.isCancelled { return }
             await MainActor.run {
                 guard let self, self.loadGeneration == token else { return }
                 switch result {
@@ -296,10 +319,74 @@ final class AppState: ObservableObject {
 
         Task.detached { [weak self] in
             struct ItemResult {
+                let oldURL: URL
                 let url: URL
                 let title: String
                 let track: String
                 let error: String?
+            }
+
+            func sanitizedFilenameStem(from title: String) -> String {
+                var s = title.trimmingCharacters(in: .whitespacesAndNewlines)
+                // Finder disallows ":" and POSIX paths disallow "/".
+                s = s.replacingOccurrences(of: "/", with: "-")
+                s = s.replacingOccurrences(of: ":", with: "-")
+                s = s.replacingOccurrences(of: "\\", with: "-")
+                if let regex = try? NSRegularExpression(pattern: #"\s+"#) {
+                    let range = NSRange(s.startIndex..., in: s)
+                    s = regex.stringByReplacingMatches(in: s, range: range, withTemplate: " ")
+                }
+                // Drop ASCII control characters that can break file operations.
+                s = String(s.unicodeScalars.filter {
+                    let v = $0.value
+                    return v >= 0x20 && v != 0x7F
+                })
+                return s.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+
+            func uniqueSiblingURL(for source: URL, stem: String) -> URL {
+                let dir = source.deletingLastPathComponent()
+                let ext = source.pathExtension
+                let candidateName = ext.isEmpty ? stem : "\(stem).\(ext)"
+
+                if source.lastPathComponent == candidateName { return source }
+
+                var candidate = dir.appendingPathComponent(candidateName)
+                var n = 2
+                while FileManager.default.fileExists(atPath: candidate.path) {
+                    let numbered = ext.isEmpty ? "\(stem) (\(n))" : "\(stem) (\(n)).\(ext)"
+                    candidate = dir.appendingPathComponent(numbered)
+                    n += 1
+                }
+                return candidate
+            }
+
+            func normalizedCoverArt(_ data: Data) -> Data? {
+                guard let source = NSImage(data: data) else { return nil }
+
+                let maxSide = 1200.0
+                let srcRep = source.representations.first
+                let srcW = max(Double(srcRep?.pixelsWide ?? Int(source.size.width)), 1)
+                let srcH = max(Double(srcRep?.pixelsHigh ?? Int(source.size.height)), 1)
+                let scale = min(1.0, maxSide / max(srcW, srcH))
+                let targetW = max(Int((srcW * scale).rounded()), 1)
+                let targetH = max(Int((srcH * scale).rounded()), 1)
+                let targetSize = NSSize(width: targetW, height: targetH)
+
+                let canvas = NSImage(size: targetSize)
+                canvas.lockFocus()
+                NSColor.white.setFill()
+                NSBezierPath(rect: NSRect(origin: .zero, size: targetSize)).fill()
+                source.draw(in: NSRect(origin: .zero, size: targetSize),
+                            from: NSRect(origin: .zero, size: source.size),
+                            operation: .sourceOver,
+                            fraction: 1.0)
+                canvas.unlockFocus()
+
+                guard let tiff = canvas.tiffRepresentation,
+                      let rep = NSBitmapImageRep(data: tiff)
+                else { return nil }
+                return rep.representation(using: .jpeg, properties: [.compressionFactor: 0.82])
             }
 
             var firstError: String?
@@ -312,20 +399,57 @@ final class AppState: ObservableObject {
                     let file = targets[idx]
                     group.addTask {
                         do {
+                            var currentURL = file.url
                             var md = (try? service.read(file.url)) ?? MediaMetadata()
                             plan.apply(to: &md,
                                        file: file,
                                        indexInSelection: idx,
                                        totalInSelection: total)
-                            let newTitle = md.title ?? file.name
-                            try service.write(md, to: file.url)
+
+                            if plan.repairCoverArt, let cover = md.coverArt,
+                               let normalized = normalizedCoverArt(cover) {
+                                md.coverArt = normalized
+                                md.coverMimeType = "image/jpeg"
+                            }
+
+                            if plan.writeFolderCoverJPG,
+                               let cover = md.coverArt {
+                                let jpg: Data
+                                if (md.coverMimeType ?? "").lowercased().contains("jpeg") {
+                                    jpg = cover
+                                } else if let normalized = normalizedCoverArt(cover) {
+                                    jpg = normalized
+                                } else {
+                                    jpg = cover
+                                }
+                                let sidecar = currentURL.deletingLastPathComponent().appendingPathComponent("cover.jpg")
+                                try jpg.write(to: sidecar, options: .atomic)
+                            }
+
+                            try service.write(md, to: currentURL)
+
+                            if plan.filenameFromTitle,
+                               let title = md.title {
+                                let stem = sanitizedFilenameStem(from: title)
+                                if !stem.isEmpty {
+                                    let destination = uniqueSiblingURL(for: currentURL, stem: stem)
+                                    if destination != currentURL {
+                                        try FileManager.default.moveItem(at: currentURL, to: destination)
+                                        currentURL = destination
+                                    }
+                                }
+                            }
+
+                            let newTitle = md.title ?? currentURL.lastPathComponent
                             let newTrack = md.trackDisplay ?? ""
-                            return ItemResult(url: file.url,
+                            return ItemResult(oldURL: file.url,
+                                              url: currentURL,
                                               title: newTitle,
                                               track: newTrack,
                                               error: nil)
                         } catch {
-                            return ItemResult(url: file.url,
+                            return ItemResult(oldURL: file.url,
+                                              url: file.url,
                                               title: file.name,
                                               track: "",
                                               error: error.localizedDescription)
@@ -345,11 +469,30 @@ final class AppState: ObservableObject {
                     let snapshot = result
                     let progress = Double(completed) / Double(total)
                     if let err = snapshot.error, firstError == nil {
-                        firstError = "\(snapshot.url.lastPathComponent): \(err)"
+                        firstError = "\(snapshot.oldURL.lastPathComponent): \(err)"
                     }
                     let didFail = snapshot.error != nil
                     await MainActor.run {
                         if !didFail {
+                            if snapshot.oldURL != snapshot.url {
+                                if let i = self?.files.firstIndex(where: { $0.id == snapshot.oldURL }) {
+                                    self?.files[i] = MediaFile(id: snapshot.url)
+                                }
+                                if self?.selectedFileIDs.contains(snapshot.oldURL) == true {
+                                    self?.selectedFileIDs.remove(snapshot.oldURL)
+                                    self?.selectedFileIDs.insert(snapshot.url)
+                                }
+                                if self?.selectedFile?.id == snapshot.oldURL {
+                                    self?.selectedFile = MediaFile(id: snapshot.url)
+                                }
+                                if let oldTitle = self?.titles.removeValue(forKey: snapshot.oldURL) {
+                                    self?.titles[snapshot.url] = oldTitle
+                                }
+                                if let oldTrack = self?.tracks.removeValue(forKey: snapshot.oldURL) {
+                                    self?.tracks[snapshot.url] = oldTrack
+                                }
+                                self?.techInfoCache.removeValue(forKey: snapshot.oldURL)
+                            }
                             self?.titles[snapshot.url] = snapshot.title
                             self?.tracks[snapshot.url] = snapshot.track
                             // File contents changed — drop cached tech info.

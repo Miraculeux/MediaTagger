@@ -92,6 +92,7 @@ struct TrackNumberingOptions: Equatable {
 /// nil fields are left untouched on the per-file metadata.
 struct BatchPlan {
     var titleFromFilename: FilenameCleanupOptions?   // if non-nil, derive TITLE from filename
+    var filenameFromTitle: Bool = false              // if true, rename file from TITLE after tag write
     var album: String?
     var albumArtist: String?
     var artist: String?
@@ -102,16 +103,18 @@ struct BatchPlan {
     var renumberTracks: TrackNumberingOptions?       // if non-nil, set TRACKNUMBER (and optionally TRACKTOTAL)
     var coverArt: Data?                              // if non-nil, replace cover art
     var coverMime: String?
+    var repairCoverArt: Bool = false                 // if true, normalize existing/new cover for compatibility
+    var writeFolderCoverJPG: Bool = false            // if true, write sibling cover.jpg from repaired cover
     var clearCoverArt: Bool = false                  // if true (and coverArt nil), remove cover
 
     /// True if at least one operation is configured.
     var hasAnyOperation: Bool {
-        titleFromFilename != nil
+        titleFromFilename != nil || filenameFromTitle
             || album != nil || albumArtist != nil || artist != nil
             || date != nil || genre != nil
             || discNumber != nil || discTotal != nil
             || renumberTracks != nil
-            || coverArt != nil || clearCoverArt
+                || coverArt != nil || repairCoverArt || writeFolderCoverJPG || clearCoverArt
     }
 
     func apply(to md: inout MediaMetadata, file: MediaFile, indexInSelection: Int, totalInSelection: Int) {

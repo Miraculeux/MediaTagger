@@ -10,23 +10,30 @@ struct SidebarView: View {
     /// Without this the tree would be rebuilt — and every visible folder's
     /// children rescanned — on every unrelated state change.
     @State private var rootNode: FolderNode?
+    @State private var searchText: String = ""
 
     var body: some View {
         Group {
             if let root = appState.rootURL, let node = rootNode {
-                List(selection: Binding(
-                    get: { appState.selectedFolder },
-                    set: { if let url = $0 { appState.loadFiles(in: url) } }
-                )) {
-                    OutlineGroup(node, children: \.children) { node in
-                        Label(node.url.lastPathComponent, systemImage: "folder")
-                            .tag(node.url)
+                VStack(spacing: 0) {
+                    toolbar
+                    Divider()
+                    if searchText.isEmpty {
+                        List(selection: Binding(
+                            get: { appState.selectedFolder },
+                            set: { if let url = $0 { appState.loadFiles(in: url) } }
+                        )) {
+                            OutlineGroup(node, children: \.children) { node in
+                                Label(node.url.lastPathComponent, systemImage: "folder")
+                                    .tag(node.url)
+                            }
+                        }
+                        .listStyle(.sidebar)
+                        .id(root)
+                    } else {
+                        searchResults(in: node)
                     }
                 }
-                .listStyle(.sidebar)
-                // Suppress unused-warning while still observing the root URL
-                // change (handled by `.onChange` below).
-                .id(root)
             } else {
                 VStack(spacing: 12) {
                     Image(systemName: "music.note.list")
@@ -43,6 +50,104 @@ struct SidebarView: View {
         }
         .onAppear(perform: syncRoot)
         .onChange(of: appState.rootURL) { _, _ in syncRoot() }
+    }
+
+    private var toolbar: some View {
+        HStack(spacing: 6) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+            TextField("Search folders", text: $searchText)
+                .textFieldStyle(.roundedBorder)
+            if !searchText.isEmpty {
+                Button {
+                    searchText = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Clear search")
+            }
+            Button(action: refresh) {
+                Image(systemName: "arrow.clockwise")
+            }
+            .buttonStyle(.borderless)
+            .help("Refresh folder tree")
+            .keyboardShortcut("r", modifiers: [.command])
+        }
+        .padding(8)
+    }
+
+    @ViewBuilder
+    private func searchResults(in root: FolderNode) -> some View {
+        let matches = collectMatches(root: root, query: searchText, limit: 500)
+        if matches.isEmpty {
+            VStack(spacing: 8) {
+                Image(systemName: "folder.badge.questionmark")
+                    .font(.title2)
+                    .foregroundStyle(.secondary)
+                Text("No folders match")
+                    .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        } else {
+            List(selection: Binding(
+                get: { appState.selectedFolder },
+                set: { if let url = $0 { appState.loadFiles(in: url) } }
+            )) {
+                ForEach(matches, id: \.url) { node in
+                    VStack(alignment: .leading, spacing: 1) {
+                        Label(node.url.lastPathComponent, systemImage: "folder")
+                        if let rootURL = appState.rootURL,
+                           let relative = relativePath(of: node.url, root: rootURL) {
+                            Text(relative)
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                        }
+                    }
+                    .tag(node.url)
+                }
+            }
+            .listStyle(.sidebar)
+        }
+    }
+
+    /// Force a full re-scan of the folder tree and the currently selected folder.
+    private func refresh() {
+        if let url = appState.rootURL {
+            rootNode = FolderNode(url: url)
+        }
+        appState.refreshFiles()
+    }
+
+    /// BFS the folder tree collecting nodes whose name contains `query`
+    /// (case-insensitive). Capped to keep the UI responsive on large libraries.
+    private func collectMatches(root: FolderNode, query: String, limit: Int) -> [FolderNode] {
+        let needle = query.lowercased()
+        var results: [FolderNode] = []
+        var queue: [FolderNode] = [root]
+        while !queue.isEmpty, results.count < limit {
+            let node = queue.removeFirst()
+            if node.url != root.url,
+               node.url.lastPathComponent.lowercased().contains(needle) {
+                results.append(node)
+            }
+            if let children = node.children {
+                queue.append(contentsOf: children)
+            }
+        }
+        return results
+    }
+
+    private func relativePath(of url: URL, root: URL) -> String? {
+        let rootPath = root.path
+        let p = url.path
+        guard p.hasPrefix(rootPath) else { return nil }
+        var rel = String(p.dropFirst(rootPath.count))
+        if rel.hasPrefix("/") { rel.removeFirst() }
+        return rel.isEmpty ? nil : rel
     }
 
     /// Rebuild the root node (discarding the entire children cache) only when

@@ -9,6 +9,7 @@ struct BatchEditorView: View {
 
     // Operation toggles
     @State private var setTitleFromFilename = false
+    @State private var setFilenameFromTitle = false
     @State private var cleanup = FilenameCleanupOptions()
 
     @State private var setAlbum = false;       @State private var album = ""
@@ -26,6 +27,8 @@ struct BatchEditorView: View {
 
     @State private var coverData: Data?
     @State private var coverMime: String?
+    @State private var repairCover = false
+    @State private var writeFolderCoverJPG = false
     @State private var clearCover = false
 
     /// True while we're programmatically writing field values; suppresses
@@ -123,6 +126,7 @@ struct BatchEditorView: View {
         VStack(alignment: .leading, spacing: 8) {
             Toggle("Set TITLE from filename", isOn: $setTitleFromFilename)
                 .font(.headline)
+            Toggle("Set filename from TITLE", isOn: $setFilenameFromTitle)
             if setTitleFromFilename {
                 VStack(alignment: .leading, spacing: 4) {
                     Toggle("Strip leading track number", isOn: $cleanup.stripLeadingTrackNumber)
@@ -214,6 +218,8 @@ struct BatchEditorView: View {
             .clipShape(RoundedRectangle(cornerRadius: 6))
             VStack(alignment: .leading, spacing: 6) {
                 Button("Choose cover…") { pickCover() }
+                Toggle("Repair covers for compatibility (JPEG, max 1200px)", isOn: $repairCover)
+                Toggle("Also write folder cover.jpg (Sony fallback)", isOn: $writeFolderCoverJPG)
                 Button("Clear cover on all files", role: .destructive) {
                     coverData = nil; coverMime = nil; clearCover = true
                 }
@@ -291,6 +297,7 @@ struct BatchEditorView: View {
     private func buildPlan() -> BatchPlan {
         var p = BatchPlan()
         if setTitleFromFilename { p.titleFromFilename = cleanup }
+        if setFilenameFromTitle { p.filenameFromTitle = true }
         if setAlbum { p.album = album }
         if setAlbumArtist { p.albumArtist = albumArtist }
         if setArtist { p.artist = artist }
@@ -308,6 +315,8 @@ struct BatchEditorView: View {
         } else if clearCover {
             p.clearCoverArt = true
         }
+        if repairCover { p.repairCoverArt = true }
+        if writeFolderCoverJPG { p.writeFolderCoverJPG = true }
         return p
     }
 

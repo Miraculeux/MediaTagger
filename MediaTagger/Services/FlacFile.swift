@@ -54,6 +54,10 @@ struct FlacFile {
     var blocks: [FlacBlock]
     /// Offset in the file where the audio frames begin (right after the last metadata block).
     var audioOffset: Int
+    /// Optional ID3v2 tag bytes that appear before the `fLaC` marker. Some
+    /// taggers prepend an ID3v2 tag to FLAC files; we preserve this prefix
+    /// verbatim on write so existing data is not lost.
+    var id3Prefix: Data = Data()
 
     // MARK: Reading
 
@@ -63,12 +67,34 @@ struct FlacFile {
     }
 
     static func parse(_ data: Data, url: URL) throws -> FlacFile {
-        guard data.count >= 4,
-              data[0] == 0x66, data[1] == 0x4C, data[2] == 0x61, data[3] == 0x43
+        var prefix = Data()
+        var startOffset = 0
+
+        // Skip an optional ID3v2 prefix ("ID3" + 2 version + 1 flags + 4 syncsafe size).
+        if data.count >= 10,
+           data[0] == 0x49, data[1] == 0x44, data[2] == 0x33 {
+            let flags = data[5]
+            let tagSize = Int(data[6] & 0x7F) << 21
+                | Int(data[7] & 0x7F) << 14
+                | Int(data[8] & 0x7F) << 7
+                | Int(data[9] & 0x7F)
+            // Bit 4 of flags indicates a 10-byte footer (ID3v2.4).
+            let footer = (flags & 0x10) != 0 ? 10 : 0
+            let totalID3 = 10 + tagSize + footer
+            guard totalID3 <= data.count else { throw FlacError.truncated }
+            prefix = data.subdata(in: 0..<totalID3)
+            startOffset = totalID3
+        }
+
+        guard startOffset + 4 <= data.count,
+              data[startOffset] == 0x66,
+              data[startOffset + 1] == 0x4C,
+              data[startOffset + 2] == 0x61,
+              data[startOffset + 3] == 0x43
         else { throw FlacError.notFlac }
 
         var blocks: [FlacBlock] = []
-        var p = 4
+        var p = startOffset + 4
         while true {
             guard p + 4 <= data.count else { throw FlacError.truncated }
             let header = data[p]
@@ -81,7 +107,7 @@ struct FlacFile {
             p += len
             if isLast { break }
         }
-        return FlacFile(url: url, blocks: blocks, audioOffset: p)
+        return FlacFile(url: url, blocks: blocks, audioOffset: p, id3Prefix: prefix)
     }
 
     // MARK: Vorbis comment
@@ -112,21 +138,21 @@ struct FlacFile {
 
     // MARK: Picture
 
-    /// Returns the first front-cover (or any) PICTURE block, decoded.
+    /// Returns the front-cover (type 3) PICTURE block if present,
+    /// otherwise falls back to the first decodable picture block.
     var firstPicture: FlacPicture? {
+        var fallback: FlacPicture?
         for b in blocks where b.type == FlacBlockType.picture {
-            if let pic = try? FlacPicture.decode(b.data) { return pic }
+            guard let pic = try? FlacPicture.decode(b.data) else { continue }
+            if pic.pictureType == 3 { return pic }
+            if fallback == nil { fallback = pic }
         }
-        return nil
+        return fallback
     }
 
     mutating func setFrontCover(_ picture: FlacPicture?) {
-        // Remove existing front-cover (type 3) pictures.
-        blocks.removeAll { block in
-            guard block.type == FlacBlockType.picture,
-                  let pic = try? FlacPicture.decode(block.data) else { return false }
-            return pic.pictureType == 3
-        }
+        // Replace all PICTURE blocks with a single front cover for maximum compatibility.
+        blocks.removeAll { $0.type == FlacBlockType.picture }
         if let picture {
             let data = picture.encode()
             blocks.insert(FlacBlock(isLast: false, type: FlacBlockType.picture, data: data),
@@ -171,13 +197,15 @@ struct FlacFile {
     /// existing one (using padding), we patch in place; otherwise we rewrite.
     func write() throws {
         let original = try Data(contentsOf: url, options: .mappedIfSafe)
-        let originalMetadataLen = audioOffset - 4 // excluding "fLaC"
+        let prefixLen = id3Prefix.count
+        let originalMetadataLen = audioOffset - prefixLen - 4 // excluding ID3v2 prefix and "fLaC"
 
         // Try to fit into existing metadata area.
         let inPlace = encodeMetadataArea(targetSize: originalMetadataLen)
         if inPlace.count == originalMetadataLen {
             var out = Data()
             out.reserveCapacity(original.count)
+            if prefixLen > 0 { out.append(id3Prefix) }
             out.append(contentsOf: [0x66, 0x4C, 0x61, 0x43])
             out.append(inPlace)
             out.append(original.subdata(in: audioOffset..<original.count))
@@ -188,7 +216,8 @@ struct FlacFile {
         // Otherwise rewrite with default padding.
         var out = Data()
         let area = encodeMetadataArea()
-        out.reserveCapacity(4 + area.count + (original.count - audioOffset))
+        out.reserveCapacity(prefixLen + 4 + area.count + (original.count - audioOffset))
+        if prefixLen > 0 { out.append(id3Prefix) }
         out.append(contentsOf: [0x66, 0x4C, 0x61, 0x43])
         out.append(area)
         out.append(original.subdata(in: audioOffset..<original.count))
