@@ -1,6 +1,8 @@
 import Foundation
 import AppKit
 import Combine
+import ImageIO
+import UniformTypeIdentifiers
 
 @MainActor
 final class AppState: ObservableObject {
@@ -362,31 +364,29 @@ final class AppState: ObservableObject {
             }
 
             func normalizedCoverArt(_ data: Data) -> Data? {
-                guard let source = NSImage(data: data) else { return nil }
-
-                let maxSide = 1200.0
-                let srcRep = source.representations.first
-                let srcW = max(Double(srcRep?.pixelsWide ?? Int(source.size.width)), 1)
-                let srcH = max(Double(srcRep?.pixelsHigh ?? Int(source.size.height)), 1)
-                let scale = min(1.0, maxSide / max(srcW, srcH))
-                let targetW = max(Int((srcW * scale).rounded()), 1)
-                let targetH = max(Int((srcH * scale).rounded()), 1)
-                let targetSize = NSSize(width: targetW, height: targetH)
-
-                let canvas = NSImage(size: targetSize)
-                canvas.lockFocus()
-                NSColor.white.setFill()
-                NSBezierPath(rect: NSRect(origin: .zero, size: targetSize)).fill()
-                source.draw(in: NSRect(origin: .zero, size: targetSize),
-                            from: NSRect(origin: .zero, size: source.size),
-                            operation: .sourceOver,
-                            fraction: 1.0)
-                canvas.unlockFocus()
-
-                guard let tiff = canvas.tiffRepresentation,
-                      let rep = NSBitmapImageRep(data: tiff)
+                // Thread-safe ImageIO path (NSImage/lockFocus is not safe off the
+                // main actor and pulled in an extra TIFF round-trip).
+                guard let src = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+                let maxPixelSize: CGFloat = 1200
+                let thumbOpts: [CFString: Any] = [
+                    kCGImageSourceCreateThumbnailFromImageAlways: true,
+                    kCGImageSourceCreateThumbnailWithTransform: true,
+                    kCGImageSourceShouldCacheImmediately: true,
+                    kCGImageSourceThumbnailMaxPixelSize: maxPixelSize,
+                ]
+                guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, thumbOpts as CFDictionary)
                 else { return nil }
-                return rep.representation(using: .jpeg, properties: [.compressionFactor: 0.82])
+
+                let out = NSMutableData()
+                guard let dest = CGImageDestinationCreateWithData(
+                    out, UTType.jpeg.identifier as CFString, 1, nil)
+                else { return nil }
+                let destOpts: [CFString: Any] = [
+                    kCGImageDestinationLossyCompressionQuality: 0.82
+                ]
+                CGImageDestinationAddImage(dest, cg, destOpts as CFDictionary)
+                guard CGImageDestinationFinalize(dest) else { return nil }
+                return out as Data
             }
 
             var firstError: String?
@@ -406,9 +406,20 @@ final class AppState: ObservableObject {
                                        indexInSelection: idx,
                                        totalInSelection: total)
 
+                            // Normalize at most once; reuse for both the
+                            // embedded cover replacement and the sibling
+                            // cover.jpg fallback to avoid a second decode.
+                            var normalizedCache: Data? = nil
+                            func normalized(_ data: Data) -> Data? {
+                                if let cached = normalizedCache { return cached }
+                                let result = normalizedCoverArt(data)
+                                if let result { normalizedCache = result }
+                                return result
+                            }
+
                             if plan.repairCoverArt, let cover = md.coverArt,
-                               let normalized = normalizedCoverArt(cover) {
-                                md.coverArt = normalized
+                               let n = normalized(cover) {
+                                md.coverArt = n
                                 md.coverMimeType = "image/jpeg"
                             }
 
@@ -417,8 +428,8 @@ final class AppState: ObservableObject {
                                 let jpg: Data
                                 if (md.coverMimeType ?? "").lowercased().contains("jpeg") {
                                     jpg = cover
-                                } else if let normalized = normalizedCoverArt(cover) {
-                                    jpg = normalized
+                                } else if let n = normalized(cover) {
+                                    jpg = n
                                 } else {
                                     jpg = cover
                                 }
