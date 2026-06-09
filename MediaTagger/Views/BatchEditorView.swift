@@ -30,6 +30,8 @@ struct BatchEditorView: View {
     @State private var repairCover = false
     @State private var writeFolderCoverJPG = false
     @State private var clearCover = false
+    @State private var fillMissingOnly = false
+    @State private var searchingForCover = false
 
     /// True while we're programmatically writing field values; suppresses
     /// the "start typing -> auto-enable checkbox" behavior in `toggledField`.
@@ -218,6 +220,18 @@ struct BatchEditorView: View {
             .clipShape(RoundedRectangle(cornerRadius: 6))
             VStack(alignment: .leading, spacing: 6) {
                 Button("Choose cover…") { pickCover() }
+                Button {
+                    Task { await useCoverFromSelection() }
+                } label: {
+                    HStack(spacing: 4) {
+                        if searchingForCover { ProgressView().controlSize(.small) }
+                        Text("Use cover from selection")
+                    }
+                }
+                .disabled(searchingForCover || appState.selectedFiles.isEmpty)
+                .help("Scan selected files and use the first embedded cover")
+                Toggle("Only apply to files without a cover", isOn: $fillMissingOnly)
+                    .disabled(coverData == nil)
                 Toggle("Repair covers for compatibility (JPEG, max 1200px)", isOn: $repairCover)
                 Toggle("Also write folder cover.jpg (Sony fallback)", isOn: $writeFolderCoverJPG)
                 Button("Clear cover on all files", role: .destructive) {
@@ -312,6 +326,7 @@ struct BatchEditorView: View {
         if let d = coverData {
             p.coverArt = d
             p.coverMime = coverMime
+            if fillMissingOnly { p.onlyFillMissingCovers = true }
         } else if clearCover {
             p.clearCoverArt = true
         }
@@ -322,5 +337,36 @@ struct BatchEditorView: View {
 
     private func apply() {
         appState.applyBatch(buildPlan())
+    }
+
+    /// Scan the current selection off the main actor for the first file that
+    /// has an embedded cover; load it into the editor so the user can apply
+    /// it (optionally only to files that don't already have one).
+    private func useCoverFromSelection() async {
+        let files = appState.selectedFiles
+        guard !files.isEmpty else { return }
+        searchingForCover = true
+        defer { searchingForCover = false }
+
+        struct Found { let data: Data; let mime: String? }
+        let found: Found? = await Task.detached(priority: .userInitiated) {
+            let svc = MetadataService()
+            for f in files {
+                guard let md = try? svc.read(f.url) else { continue }
+                if let data = md.coverArt {
+                    return Found(data: data, mime: md.coverMimeType)
+                }
+            }
+            return nil
+        }.value
+
+        if let found {
+            coverData = found.data
+            coverMime = found.mime
+            clearCover = false
+            if !fillMissingOnly { fillMissingOnly = true }
+        } else {
+            appState.lastError = "No embedded cover found in the selected files."
+        }
     }
 }

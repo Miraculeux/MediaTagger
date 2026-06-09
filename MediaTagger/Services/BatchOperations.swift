@@ -106,6 +106,7 @@ struct BatchPlan {
     var repairCoverArt: Bool = false                 // if true, normalize existing/new cover for compatibility
     var writeFolderCoverJPG: Bool = false            // if true, write sibling cover.jpg from repaired cover
     var clearCoverArt: Bool = false                  // if true (and coverArt nil), remove cover
+    var onlyFillMissingCovers: Bool = false          // if true, only set coverArt on files that don't already have one
 
     /// True if at least one operation is configured.
     var hasAnyOperation: Bool {
@@ -136,8 +137,10 @@ struct BatchPlan {
             }
         }
         if let data = coverArt {
-            md.coverArt = data
-            md.coverMimeType = coverMime ?? md.coverMimeType
+            if !(onlyFillMissingCovers && md.coverArt != nil) {
+                md.coverArt = data
+                md.coverMimeType = coverMime ?? md.coverMimeType
+            }
         } else if clearCoverArt {
             md.coverArt = nil
             md.coverMimeType = nil
