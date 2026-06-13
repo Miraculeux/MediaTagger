@@ -174,6 +174,10 @@ struct SidebarView: View {
             confirmAndRepairCovers(under: url)
         }
         .disabled(appState.batchInProgress)
+        Button("Normalize Embedded Covers in Subfolders…") {
+            confirmAndNormalizeCovers(under: url)
+        }
+        .disabled(appState.batchInProgress)
     }
 
     /// Show a small confirmation alert (the operation rewrites tag chunks
@@ -192,6 +196,28 @@ struct SidebarView: View {
         alert.addButton(withTitle: "Cancel")
         if alert.runModal() == .alertFirstButtonReturn {
             appState.autoRepairCovers(under: url)
+        }
+    }
+
+    /// Confirmation + kick-off for the Sony-compatibility pass: re-encodes
+    /// existing embedded covers that don't fit the format profile (JPEG,
+    /// <= 1500 px, <= 600 KB) so Sony Walkman / Hi-Res Player apps display
+    /// them.
+    private func confirmAndNormalizeCovers(under url: URL) {
+        let alert = NSAlert()
+        alert.messageText = "Normalize embedded covers in \"\(url.lastPathComponent)\"?"
+        alert.informativeText = """
+            Recursively scans every subfolder. In each folder, if the first \
+            track's embedded cover isn't JPEG, is larger than 1500 px, or \
+            exceeds 600 KB, it's re-encoded to a 1200 px JPEG (~200 KB) and \
+            rewritten to every file in the folder. Folders without an \
+            embedded cover or with an already-conforming one are skipped.
+            """
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Normalize")
+        alert.addButton(withTitle: "Cancel")
+        if alert.runModal() == .alertFirstButtonReturn {
+            appState.normalizeEmbeddedCovers(under: url)
         }
     }
 }

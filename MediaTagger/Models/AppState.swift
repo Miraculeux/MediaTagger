@@ -727,6 +727,225 @@ final class AppState: ObservableObject {
         batchTask?.cancel()
     }
 
+    // MARK: - Normalize embedded covers (Sony-compatibility pass)
+
+    /// Recursively walk every subdirectory under `root` and re-encode any
+    /// embedded cover that doesn't conform to the format profile Sony
+    /// players (Walkman / Hi-Res Player apps) reliably display:
+    ///
+    ///   - actual JPEG bytes (magic FF D8 FF), with mime "image/jpeg"
+    ///   - max(width, height) <= 1500 px
+    ///   - <= 600 KB on disk
+    ///
+    /// Per directory: read the **first** audio file (alphabetical). If it
+    /// has no cover the directory is skipped silently (the missing-cover
+    /// pass is a separate menu item). If the cover already conforms the
+    /// whole directory is skipped, mirroring `autoRepairCovers`. Otherwise
+    /// the existing embedded cover is normalized via the same `~200 KB
+    /// 1200 px JPEG` pipeline as cover writes elsewhere in the app, and
+    /// rewritten to every audio file in the directory.
+    func normalizeEmbeddedCovers(under root: URL) {
+        guard !batchInProgress else { return }
+        batchInProgress = true
+        batchProgress = 0
+        batchDescription = "Scanning \(root.lastPathComponent)…"
+        lastError = nil
+
+        let service = metadataService
+        let isExternal = isURLOnExternalVolume(root)
+        let maxConcurrent = isExternal ? 2 : 4
+        let rootURL = root
+
+        batchTask = Task.detached { [weak self] in
+            let dirs = await Self.collectAudioDirs(under: rootURL)
+            let totalDirs = dirs.count
+            guard totalDirs > 0 else {
+                await MainActor.run {
+                    self?.batchInProgress = false
+                    self?.batchDescription = ""
+                    self?.batchTask = nil
+                    self?.lastError = "No music files found under \(rootURL.lastPathComponent)"
+                }
+                return
+            }
+            if Task.isCancelled {
+                await MainActor.run {
+                    self?.batchInProgress = false
+                    self?.batchDescription = ""
+                    self?.batchTask = nil
+                }
+                return
+            }
+            await MainActor.run {
+                self?.batchDescription = "Normalizing covers in \(totalDirs) folder\(totalDirs == 1 ? "" : "s")…"
+            }
+
+            var completed = 0
+            // `alreadyCovered` is reused to mean "already conforming";
+            // `noCandidate` to mean "no embedded cover".
+            var stats = (normalized: 0, alreadyConforming: 0, noCover: 0, errors: 0)
+            var firstError: String?
+
+            await withTaskGroup(of: CoverRepairResult.self) { group in
+                var iter = dirs.makeIterator()
+
+                func enqueueNext() {
+                    guard !Task.isCancelled, let dir = iter.next() else { return }
+                    group.addTask {
+                        await Self.normalizeCoversInDirectory(dir, service: service)
+                    }
+                }
+                for _ in 0..<maxConcurrent { enqueueNext() }
+
+                while let res = await group.next() {
+                    if Task.isCancelled { group.cancelAll(); continue }
+                    completed += 1
+                    switch res.status {
+                    case .repaired:        stats.normalized += 1
+                    case .alreadyCovered:  stats.alreadyConforming += 1
+                    case .noCandidate:     stats.noCover += 1
+                    case .error(let s):
+                        stats.errors += 1
+                        if firstError == nil {
+                            firstError = "\(res.dir.lastPathComponent): \(s)"
+                        }
+                    }
+                    let progress = Double(completed) / Double(totalDirs)
+                    await MainActor.run { self?.batchProgress = progress }
+                    enqueueNext()
+                }
+            }
+
+            let wasCancelled = Task.isCancelled
+            await MainActor.run {
+                guard let self else { return }
+                self.batchInProgress = false
+                self.batchProgress = 0
+                self.batchDescription = ""
+                self.batchTask = nil
+                if let firstError {
+                    self.lastError = firstError
+                }
+                self.refreshFiles()
+                let summary = "Normalize covers" +
+                              (wasCancelled ? " (cancelled)" : "") +
+                              ": \(stats.normalized) normalized, " +
+                              "\(stats.alreadyConforming) already conforming, " +
+                              "\(stats.noCover) without embedded cover" +
+                              (stats.errors > 0 ? ", \(stats.errors) errors" : "")
+                NSLog("MediaTagger: %@", summary)
+                let alert = NSAlert()
+                alert.messageText = wasCancelled
+                    ? "Normalize embedded covers cancelled"
+                    : "Normalize embedded covers complete"
+                alert.informativeText = summary
+                alert.alertStyle = .informational
+                alert.addButton(withTitle: "OK")
+                alert.runModal()
+            }
+        }
+    }
+
+    private nonisolated static func normalizeCoversInDirectory(
+        _ dir: URL,
+        service: MetadataService
+    ) async -> CoverRepairResult {
+        let fm = FileManager.default
+        guard let items = try? fm.contentsOfDirectory(
+            at: dir,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles, .skipsSubdirectoryDescendants]
+        ) else {
+            return CoverRepairResult(dir: dir, repairedFiles: 0, status: .noCandidate)
+        }
+        let audioFiles = items
+            .filter { MediaFile.isSupported($0) && !MediaFile.isImage($0) }
+            .sorted {
+                $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending
+            }
+        guard let first = audioFiles.first else {
+            return CoverRepairResult(dir: dir, repairedFiles: 0, status: .noCandidate)
+        }
+
+        // Sample the first file. No cover at all = nothing to normalize.
+        guard let firstMd = try? service.read(first),
+              let existingCover = firstMd.coverArt
+        else {
+            return CoverRepairResult(dir: dir, repairedFiles: 0, status: .noCandidate)
+        }
+
+        if isCoverConforming(existingCover, declaredMime: firstMd.coverMimeType) {
+            return CoverRepairResult(dir: dir, repairedFiles: 0, status: .alreadyCovered)
+        }
+
+        // Re-encode through the same pipeline used everywhere else so the
+        // output matches what the rest of the app produces (1200 px JPEG,
+        // ~200 KB), keeping the FLAC in-place patch path valid.
+        guard let normalized = normalizedCoverJPEG(existingCover) else {
+            return CoverRepairResult(
+                dir: dir, repairedFiles: 0,
+                status: .error("Could not decode embedded cover"))
+        }
+
+        var repairedCount = 0
+        var lastErr: String?
+        for file in audioFiles {
+            if Task.isCancelled { break }
+            do {
+                var md = (try? service.read(file)) ?? MediaMetadata()
+                md.coverArt = normalized
+                md.coverMimeType = "image/jpeg"
+                try service.write(md, to: file)
+                repairedCount += 1
+            } catch {
+                lastErr = error.localizedDescription
+            }
+        }
+
+        if repairedCount == 0, let lastErr {
+            return CoverRepairResult(dir: dir, repairedFiles: 0, status: .error(lastErr))
+        }
+        return CoverRepairResult(dir: dir, repairedFiles: repairedCount, status: .repaired)
+    }
+
+    /// Heuristic match for the embedded-cover format that Sony hardware
+    /// players reliably display. Aligned with `normalizedCoverJPEG`'s
+    /// output so files we already touched aren't rewritten on every pass.
+    ///
+    /// Returns `true` iff the cover is:
+    ///   - actual JPEG bytes (FF D8 FF) — Sony firmware ignores PNG/HEIC
+    ///   - declared as image/jpeg (with a small slack for missing MIME)
+    ///   - <= 1500 px on the long edge
+    ///   - <= 600 KB on disk
+    private nonisolated static func isCoverConforming(
+        _ data: Data,
+        declaredMime: String?
+    ) -> Bool {
+        // Magic bytes.
+        guard data.count >= 3,
+              data[0] == 0xFF, data[1] == 0xD8, data[2] == 0xFF
+        else { return false }
+        // Declared MIME (some writers omit this; tolerate missing/empty,
+        // but reject explicit non-JPEG labels like "image/png" since some
+        // Sony players key off the field instead of the bytes).
+        if let m = declaredMime, !m.isEmpty,
+           !m.lowercased().contains("jpeg") {
+            return false
+        }
+        // Size cap.
+        if data.count > 600 * 1024 { return false }
+        // Dimensions.
+        guard let src = CGImageSourceCreateWithData(data as CFData, nil),
+              let props = CGImageSourceCopyPropertiesAtIndex(src, 0, nil) as? [CFString: Any],
+              let w = props[kCGImagePropertyPixelWidth] as? Int,
+              let h = props[kCGImagePropertyPixelHeight] as? Int
+        else { return false }
+        if max(w, h) > 1500 { return false }
+        return true
+    }
+
+    // MARK: - Auto-repair covers — shared helpers
+
     /// BFS the directory tree starting at `root`, returning every directory
     /// that contains at least one taggable audio/video file. Symlinks are
     /// not followed; hidden files / packages (e.g. `.app`) are skipped.
