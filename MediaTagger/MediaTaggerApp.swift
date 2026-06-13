@@ -1,10 +1,22 @@
 import SwiftUI
 import AppKit
+#if canImport(VLCKit)
+import VLCKit
+#endif
 
 @main
 struct MediaTaggerApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var appState = AppState()
+
+    init() {
+        #if DEBUG && canImport(VLCKit)
+        // Stream libVLC's own diagnostics to stderr so issues like "DSF plays
+        // but no sound" surface in the Run terminal instead of being silent.
+        VLCLibrary.shared().debugLogging = true
+        VLCLibrary.shared().debugLoggingLevel = 3
+        #endif
+    }
 
     var body: some Scene {
         WindowGroup {

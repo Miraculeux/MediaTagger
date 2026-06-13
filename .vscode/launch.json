@@ -13,7 +13,13 @@
             "program": "${workspaceFolder}/build/Build/Products/Debug/MediaTagger.app/Contents/MacOS/MediaTagger",
             "args": [],
             "cwd": "${workspaceFolder}",
-            "terminal": "integrated",
+            // Route stdio to the Debug Console instead of an integrated
+            // terminal. The integrated-terminal helper (codelldb-launch)
+            // occasionally fails to send the `terminated` event when the
+            // GUI app exits on window close, leaving the debug session
+            // stuck in a "running" state in the VS Code UI even though
+            // the process is already gone.
+            "terminal": "console",
             "preLaunchTask": "MediaTagger: Build (Debug)"
         },
         {

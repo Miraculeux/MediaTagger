@@ -34,6 +34,12 @@ struct PlayerView: View {
                     // the VLC fallback player's transport.
                     VolumeBar(volume: $controller.volume)
                 }
+            } else if PlayerView.vlcUndecodableExtensions.contains(url.pathExtension.lowercased()) {
+                // VLCKit 3.7.x demuxes DSF/DFF but the FFmpeg DSD codec IDs
+                // aren't mapped to a VLC fourcc in this build, so the audio
+                // chain runs with an empty fourcc — clock advances, no sound.
+                // Show the same chip we use when VLCKit is missing entirely.
+                UnsupportedChip(ext: url.pathExtension.lowercased())
             } else {
                 // Hand off to VLC for unsupported containers. When VLCKit
                 // isn't linked, VLCPlayerView shows the same chip the
@@ -64,6 +70,10 @@ struct PlayerView: View {
         // Video
         "mp4", "m4v", "mov",
     ]
+
+    /// Extensions VLCKit 3.7.x demuxes but can't decode (empty fourcc in the
+    /// avformat → avcodec bridge). Routed straight to the unsupported chip.
+    static let vlcUndecodableExtensions: Set<String> = ["dsf", "dff"]
 }
 
 /// Owns the `AVPlayer` instance so it survives view re-creation.
