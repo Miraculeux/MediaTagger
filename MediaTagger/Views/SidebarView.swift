@@ -26,6 +26,7 @@ struct SidebarView: View {
                             OutlineGroup(node, children: \.children) { node in
                                 Label(node.url.lastPathComponent, systemImage: "folder")
                                     .tag(node.url)
+                                    .contextMenu { folderContextMenu(for: node.url) }
                             }
                         }
                         .listStyle(.sidebar)
@@ -108,6 +109,7 @@ struct SidebarView: View {
                         }
                     }
                     .tag(node.url)
+                    .contextMenu { folderContextMenu(for: node.url) }
                 }
             }
             .listStyle(.sidebar)
@@ -157,6 +159,39 @@ struct SidebarView: View {
             if rootNode?.url != url { rootNode = FolderNode(url: url) }
         } else {
             rootNode = nil
+        }
+    }
+
+    /// Right-click menu shared by the OutlineGroup rows and the search-result
+    /// rows. Reveals folder commands that don't fit on the toolbar.
+    @ViewBuilder
+    private func folderContextMenu(for url: URL) -> some View {
+        Button("Reveal in Finder") {
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        }
+        Divider()
+        Button("Auto-repair Covers in Subfolders…") {
+            confirmAndRepairCovers(under: url)
+        }
+        .disabled(appState.batchInProgress)
+    }
+
+    /// Show a small confirmation alert (the operation rewrites tag chunks
+    /// across potentially many files) and kick off the recursive repair.
+    private func confirmAndRepairCovers(under url: URL) {
+        let alert = NSAlert()
+        alert.messageText = "Auto-repair covers in \"\(url.lastPathComponent)\"?"
+        alert.informativeText = """
+            Recursively scans every subfolder. In each folder that contains \
+            music files, if the first track is missing a cover, an image is \
+            picked (cover.* → front.* → folder-named image → first image) \
+            and embedded into all files in that folder.
+            """
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Repair")
+        alert.addButton(withTitle: "Cancel")
+        if alert.runModal() == .alertFirstButtonReturn {
+            appState.autoRepairCovers(under: url)
         }
     }
 }

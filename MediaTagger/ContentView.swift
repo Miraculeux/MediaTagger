@@ -27,6 +27,13 @@ struct ContentView: View {
                 .navigationSplitViewColumnWidth(min: 320, ideal: columnWidths.detail)
         }
         .navigationTitle(appState.rootURL?.lastPathComponent ?? "Media Tagger")
+        // Floating progress + cancel button over the whole window so
+        // long-running batches (auto-repair covers, batch tag edit) can be
+        // interrupted from anywhere, not just the editor that launched them.
+        .overlay(alignment: .bottom) {
+            BatchProgressOverlay()
+                .animation(.easeInOut(duration: 0.15), value: appState.batchInProgress)
+        }
         .toolbar {
             ToolbarItem(placement: .navigation) {
                 Button {

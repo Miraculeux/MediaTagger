@@ -24,6 +24,14 @@ final class AppState: ObservableObject {
     // Batch progress
     @Published var batchInProgress: Bool = false
     @Published var batchProgress: Double = 0   // 0...1
+    /// Short description of the currently running batch (e.g. "Editing 12
+    /// files…" / "Auto-repairing covers in 47 folders…"). Surfaced in the
+    /// floating progress HUD so the user knows what they're cancelling.
+    @Published var batchDescription: String = ""
+
+    /// Currently running batch task, retained so `cancelBatch()` can stop it.
+    /// Cleared automatically when the task completes.
+    private var batchTask: Task<Void, Never>?
 
     // Status / errors
     @Published var lastError: String?
@@ -124,23 +132,44 @@ final class AppState: ObservableObject {
                 .filter { MediaFile.isSupported($0) }
                 .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
             files = mediaURLs.map { MediaFile(id: $0) }
-            // lazily load titles in background
+            // Lazily load titles in background. We fan out across a small
+            // pool of workers — sidebar prefetch is dominated by per-file
+            // open() + read() latency on external/network volumes, so
+            // running a handful of reads in parallel cuts wall-clock time
+            // by ~Nx. Cap the pool to avoid spinning up dozens of FDs on
+            // huge folders.
             titleLoadTask = Task.detached { [weak self, files = files, scanToken] in
                 let service = MetadataService()
-                for f in files {
-                    if Task.isCancelled { return }
-                    guard let md = try? service.read(f.url) else { continue }
-                    if Task.isCancelled { return }
-                    let title = md.title
-                    let track = md.trackDisplay
-                    await MainActor.run {
-                        guard !Task.isCancelled,
-                              let self,
-                              self.titleLoadGeneration == scanToken
-                        else { return }
-                        if let title { self.titles[f.url] = title }
-                        if let track { self.tracks[f.url] = track }
+                await withTaskGroup(of: (URL, String?, String?)?.self) { group in
+                    var inFlight = 0
+                    let maxConcurrent = 6
+                    var iter = files.makeIterator()
+                    func addNext() {
+                        guard let f = iter.next() else { return }
+                        inFlight += 1
+                        group.addTask {
+                            if Task.isCancelled { return nil }
+                            guard let md = try? service.read(f.url) else { return (f.url, nil, nil) }
+                            return (f.url, md.title, md.trackDisplay)
+                        }
                     }
+                    for _ in 0..<maxConcurrent { addNext() }
+                    while let result = await group.next() {
+                        inFlight -= 1
+                        if Task.isCancelled { group.cancelAll(); return }
+                        if let (url, title, track) = result {
+                            await MainActor.run {
+                                guard !Task.isCancelled,
+                                      let self,
+                                      self.titleLoadGeneration == scanToken
+                                else { return }
+                                if let title { self.titles[url] = title }
+                                if let track { self.tracks[url] = track }
+                            }
+                        }
+                        addNext()
+                    }
+                    _ = inFlight
                 }
             }
         } catch {
@@ -314,12 +343,20 @@ final class AppState: ObservableObject {
         guard !targets.isEmpty else { return }
         batchInProgress = true
         batchProgress = 0
+        batchDescription = "Editing \(targets.count) file\(targets.count == 1 ? "" : "s")…"
         lastError = nil
         let service = metadataService
         let total = targets.count
-        let maxConcurrent = max(2, min(ProcessInfo.processInfo.activeProcessorCount, 6))
+        // On a removable/external volume (USB HDD, SD card, …) running many
+        // concurrent rewrites of large audio files thrashes the head and is
+        // net-slower than 2-way parallelism. Internal/local volumes (SSD)
+        // happily handle 6-way without degradation.
+        let isExternal = isURLOnExternalVolume(targets.first?.url)
+        let maxConcurrent = isExternal
+            ? 2
+            : max(2, min(ProcessInfo.processInfo.activeProcessorCount, 6))
 
-        Task.detached { [weak self] in
+        batchTask = Task.detached { [weak self] in
             struct ItemResult {
                 let oldURL: URL
                 let url: URL
@@ -391,6 +428,17 @@ final class AppState: ObservableObject {
 
             var firstError: String?
             var completed = 0
+
+            // Pre-normalize the batch cover ONCE so 12 files don't each
+            // decode + re-encode a multi-MB scan in parallel — and so the
+            // resulting ~200 KB JPEG fits inside the typical 256 KB FLAC
+            // padding slot, letting `FlacFile.write` take the in-place
+            // patch path instead of rewriting multi-GB audio bodies.
+            var plan = plan
+            if let raw = plan.coverArt, let n = normalizedCoverArt(raw) {
+                plan.coverArt = n
+                plan.coverMime = "image/jpeg"
+            }
 
             await withTaskGroup(of: ItemResult.self) { group in
                 var nextIndex = 0
@@ -476,6 +524,7 @@ final class AppState: ObservableObject {
 
                 // As each task completes, publish its result and enqueue the next.
                 while let result = await group.next() {
+                    if Task.isCancelled { group.cancelAll(); continue }
                     completed += 1
                     let snapshot = result
                     let progress = Double(completed) / Double(total)
@@ -512,17 +561,338 @@ final class AppState: ObservableObject {
                         self?.batchProgress = progress
                     }
 
-                    if nextIndex < total {
+                    if nextIndex < total, !Task.isCancelled {
                         enqueue(nextIndex)
                         nextIndex += 1
                     }
                 }
             }
 
+            let wasCancelled = Task.isCancelled
             await MainActor.run {
                 self?.batchInProgress = false
-                if let firstError { self?.lastError = firstError }
+                self?.batchDescription = ""
+                self?.batchTask = nil
+                if wasCancelled {
+                    self?.lastError = "Batch cancelled (\(completed)/\(total) files processed)"
+                } else if let firstError {
+                    self?.lastError = firstError
+                }
             }
+        }
+    }
+
+    /// True if `url` lives on a volume that's not the boot drive — used to
+    /// dial down batch write concurrency on USB HDDs / network shares where
+    /// many parallel rewrites only thrash the underlying media.
+    private nonisolated func isURLOnExternalVolume(_ url: URL?) -> Bool {
+        guard let url else { return false }
+        let keys: Set<URLResourceKey> = [.volumeIsInternalKey, .volumeIsRemovableKey]
+        guard let vals = try? url.resourceValues(forKeys: keys) else { return false }
+        if vals.volumeIsRemovable == true { return true }
+        if vals.volumeIsInternal == false { return true }
+        return false
+    }
+
+    // MARK: - Auto-repair covers
+
+    /// Recursively walk every subdirectory under `root` and embed a folder
+    /// cover into music files that don't already have one. Rules per
+    /// directory (mirrors the sidebar context-menu wording):
+    ///
+    ///   1. Sort the directory's audio files alphabetically. If the **first**
+    ///      one already has an embedded cover, treat every sibling as
+    ///      already-covered and skip the whole directory. This avoids
+    ///      re-reading every file in long albums when a quick sample tells us
+    ///      the album is already tagged.
+    ///   2. Otherwise, look for a cover image in the same directory, in
+    ///      priority order:
+    ///         a) `cover.{jpg,jpeg,png,heic,heif}`
+    ///         b) `front.{jpg,jpeg,png,heic,heif}`
+    ///         c) image file whose stem matches the directory name
+    ///         d) first image file (sorted alphabetically)
+    ///   3. If a candidate is found, normalize it once (1200 px JPEG, ~200 KB)
+    ///      so it fits inside FLAC's default padding slot and embed it into
+    ///      every audio file in the directory.
+    ///
+    /// Skipped silently: directories without audio files, directories without
+    /// a candidate cover image, and unreadable files.
+    func autoRepairCovers(under root: URL) {
+        guard !batchInProgress else { return }
+        batchInProgress = true
+        batchProgress = 0
+        batchDescription = "Scanning \(root.lastPathComponent)…"
+        lastError = nil
+
+        let service = metadataService
+        let isExternal = isURLOnExternalVolume(root)
+        let maxConcurrent = isExternal ? 2 : 4
+        let rootURL = root
+
+        batchTask = Task.detached { [weak self] in
+            // 1. Collect every subdirectory (including the root itself).
+            let dirs = await Self.collectAudioDirs(under: rootURL)
+            let totalDirs = dirs.count
+            guard totalDirs > 0 else {
+                await MainActor.run {
+                    self?.batchInProgress = false
+                    self?.batchDescription = ""
+                    self?.batchTask = nil
+                    self?.lastError = "No music files found under \(rootURL.lastPathComponent)"
+                }
+                return
+            }
+            if Task.isCancelled {
+                await MainActor.run {
+                    self?.batchInProgress = false
+                    self?.batchDescription = ""
+                    self?.batchTask = nil
+                }
+                return
+            }
+            await MainActor.run {
+                self?.batchDescription = "Repairing covers in \(totalDirs) folder\(totalDirs == 1 ? "" : "s")…"
+            }
+
+            var completed = 0
+            var stats = (repaired: 0, alreadyCovered: 0, noCandidate: 0, errors: 0)
+            var firstError: String?
+
+            await withTaskGroup(of: CoverRepairResult.self) { group in
+                var iter = dirs.makeIterator()
+
+                func enqueueNext() {
+                    guard !Task.isCancelled, let dir = iter.next() else { return }
+                    group.addTask {
+                        await Self.repairCoversInDirectory(dir, service: service)
+                    }
+                }
+                for _ in 0..<maxConcurrent { enqueueNext() }
+
+                while let res = await group.next() {
+                    if Task.isCancelled { group.cancelAll(); continue }
+                    completed += 1
+                    switch res.status {
+                    case .repaired:        stats.repaired += 1
+                    case .alreadyCovered:  stats.alreadyCovered += 1
+                    case .noCandidate:     stats.noCandidate += 1
+                    case .error(let s):
+                        stats.errors += 1
+                        if firstError == nil {
+                            firstError = "\(res.dir.lastPathComponent): \(s)"
+                        }
+                    }
+                    let progress = Double(completed) / Double(totalDirs)
+                    await MainActor.run { self?.batchProgress = progress }
+                    enqueueNext()
+                }
+            }
+
+            let wasCancelled = Task.isCancelled
+            await MainActor.run {
+                guard let self else { return }
+                self.batchInProgress = false
+                self.batchProgress = 0
+                self.batchDescription = ""
+                self.batchTask = nil
+                if let firstError {
+                    self.lastError = firstError
+                }
+                // Refresh the currently-shown folder so embedded covers
+                // appear in the editor without manual reload.
+                self.refreshFiles()
+                let summary = "Auto-repair covers" +
+                              (wasCancelled ? " (cancelled)" : "") +
+                              ": \(stats.repaired) repaired, " +
+                              "\(stats.alreadyCovered) already covered, " +
+                              "\(stats.noCandidate) without candidate" +
+                              (stats.errors > 0 ? ", \(stats.errors) errors" : "")
+                NSLog("MediaTagger: %@", summary)
+                let alert = NSAlert()
+                alert.messageText = wasCancelled
+                    ? "Auto-repair covers cancelled"
+                    : "Auto-repair covers complete"
+                alert.informativeText = summary
+                alert.alertStyle = .informational
+                alert.addButton(withTitle: "OK")
+                alert.runModal()
+            }
+        }
+    }
+
+    /// Cancel the currently-running batch (applyBatch / autoRepairCovers).
+    /// Tasks already in flight finish their current file, then the loop
+    /// exits early; UI returns to idle and a summary is shown.
+    func cancelBatch() {
+        batchTask?.cancel()
+    }
+
+    /// BFS the directory tree starting at `root`, returning every directory
+    /// that contains at least one taggable audio/video file. Symlinks are
+    /// not followed; hidden files / packages (e.g. `.app`) are skipped.
+    private nonisolated static func collectAudioDirs(under root: URL) async -> [URL] {
+        let fm = FileManager.default
+        var out: [URL] = []
+        var queue: [URL] = [root]
+        while !queue.isEmpty {
+            if Task.isCancelled { return out }
+            let dir = queue.removeFirst()
+            guard let items = try? fm.contentsOfDirectory(
+                at: dir,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles, .skipsPackageDescendants]
+            ) else { continue }
+
+            var hasAudio = false
+            for item in items {
+                let isDir = (try? item.resourceValues(forKeys: [.isDirectoryKey])
+                                  .isDirectory) ?? false
+                if isDir {
+                    queue.append(item)
+                } else if MediaFile.isSupported(item) && !MediaFile.isImage(item) {
+                    hasAudio = true
+                }
+            }
+            if hasAudio { out.append(dir) }
+        }
+        return out
+    }
+
+    /// Returns the chosen cover image URL for `dir`, or `nil` if no candidate
+    /// matches the priority list. Pure file-naming logic, no IO beyond the
+    /// directory listing.
+    private nonisolated static func pickCoverCandidate(images: [URL], dirName: String) -> URL? {
+        // Common image extensions we'll embed. (Restricted vs. the read-only
+        // set in MediaFile.imageExtensions — embedding TIFF/GIF in audio tags
+        // works poorly in many players.)
+        let coverExts: Set<String> = ["jpg", "jpeg", "png", "heic", "heif"]
+        let candidates = images.filter { coverExts.contains($0.pathExtension.lowercased()) }
+        if candidates.isEmpty { return nil }
+
+        func firstMatching(_ stem: String) -> URL? {
+            candidates.first {
+                $0.deletingPathExtension().lastPathComponent
+                    .caseInsensitiveCompare(stem) == .orderedSame
+            }
+        }
+        if let u = firstMatching("cover") { return u }
+        if let u = firstMatching("front") { return u }
+        if let u = firstMatching(dirName) { return u }
+        return candidates.sorted {
+            $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending
+        }.first
+    }
+
+    private nonisolated static func repairCoversInDirectory(
+        _ dir: URL,
+        service: MetadataService
+    ) async -> CoverRepairResult {
+        let fm = FileManager.default
+        guard let items = try? fm.contentsOfDirectory(
+            at: dir,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles, .skipsSubdirectoryDescendants]
+        ) else {
+            return CoverRepairResult(dir: dir, repairedFiles: 0, status: .noCandidate)
+        }
+        let audioFiles = items
+            .filter { MediaFile.isSupported($0) && !MediaFile.isImage($0) }
+            .sorted {
+                $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending
+            }
+        guard let first = audioFiles.first else {
+            return CoverRepairResult(dir: dir, repairedFiles: 0, status: .noCandidate)
+        }
+
+        // Sample the first file: if it already has a cover, treat the whole
+        // directory as done. This matches the spec and keeps the scan O(dirs)
+        // instead of O(files) on already-tagged libraries.
+        if let firstMd = try? service.read(first), firstMd.coverArt != nil {
+            return CoverRepairResult(dir: dir, repairedFiles: 0, status: .alreadyCovered)
+        }
+
+        let imageItems = items.filter { MediaFile.isImage($0) }
+        guard let coverURL = pickCoverCandidate(
+            images: imageItems,
+            dirName: dir.lastPathComponent
+        ) else {
+            return CoverRepairResult(dir: dir, repairedFiles: 0, status: .noCandidate)
+        }
+        guard let raw = try? Data(contentsOf: coverURL) else {
+            return CoverRepairResult(
+                dir: dir, repairedFiles: 0,
+                status: .error("Could not read \(coverURL.lastPathComponent)"))
+        }
+        // Normalize once to ~200 KB JPEG so the embed fits typical FLAC
+        // padding slots and the in-place patch path stays valid.
+        let normalized: Data
+        let mime: String
+        if let n = normalizedCoverJPEG(raw) {
+            normalized = n
+            mime = "image/jpeg"
+        } else {
+            normalized = raw
+            mime = mimeForImageURL(coverURL)
+        }
+
+        var repairedCount = 0
+        var lastErr: String?
+        for file in audioFiles {
+            if Task.isCancelled { break }
+            do {
+                var md = (try? service.read(file)) ?? MediaMetadata()
+                md.coverArt = normalized
+                md.coverMimeType = mime
+                try service.write(md, to: file)
+                repairedCount += 1
+            } catch {
+                lastErr = error.localizedDescription
+            }
+        }
+
+        if repairedCount == 0, let lastErr {
+            return CoverRepairResult(dir: dir, repairedFiles: 0, status: .error(lastErr))
+        }
+        return CoverRepairResult(dir: dir, repairedFiles: repairedCount, status: .repaired)
+    }
+
+    /// Status type for `repairCoversInDirectory`. Kept at file scope so the
+    /// `TaskGroup` element type stays a simple struct value.
+    private enum CoverRepairStatus {
+        case repaired, alreadyCovered, noCandidate, error(String)
+    }
+
+    private struct CoverRepairResult {
+        let dir: URL
+        let repairedFiles: Int
+        let status: CoverRepairStatus
+    }
+
+    private nonisolated static func normalizedCoverJPEG(_ data: Data) -> Data? {
+        guard let src = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
+        let thumbOpts: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: 1200,
+        ]
+        guard let cg = CGImageSourceCreateThumbnailAtIndex(src, 0, thumbOpts as CFDictionary)
+        else { return nil }
+        let out = NSMutableData()
+        guard let dest = CGImageDestinationCreateWithData(
+            out, UTType.jpeg.identifier as CFString, 1, nil)
+        else { return nil }
+        CGImageDestinationAddImage(dest, cg,
+            [kCGImageDestinationLossyCompressionQuality: 0.82] as CFDictionary)
+        guard CGImageDestinationFinalize(dest) else { return nil }
+        return out as Data
+    }
+
+    private nonisolated static func mimeForImageURL(_ url: URL) -> String {
+        switch url.pathExtension.lowercased() {
+        case "png":          return "image/png"
+        case "heic", "heif": return "image/heic"
+        default:             return "image/jpeg"
         }
     }
 
