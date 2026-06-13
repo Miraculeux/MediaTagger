@@ -4,9 +4,10 @@ import Foundation
 /// avoiding the multi-GB memory spikes that happen when a metadata writer
 /// loads an entire audio file into `Data` just to patch a few bytes of tags.
 enum IOStreaming {
-    /// 4 MiB chunks: big enough to keep syscall overhead negligible, small
-    /// enough to stay friendly to network volumes and external SD cards.
-    static let defaultChunkSize = 4 * 1024 * 1024
+    /// 16 MiB chunks: fewer syscalls on slow external/network volumes where
+    /// each `read()`/`write()` has measurable latency. Still small enough
+    /// that the resident-set bump while streaming a 1 GB FLAC stays bounded.
+    static let defaultChunkSize = 16 * 1024 * 1024
 
     enum Error: Swift.Error, LocalizedError {
         case shortRead(expected: UInt64, actual: UInt64)

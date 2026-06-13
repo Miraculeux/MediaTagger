@@ -30,27 +30,42 @@ struct AIFFFile {
 
     // MARK: - Read
 
+    /// Stream the chunk list via `FileHandle`: read the 12-byte FORM header,
+    /// then for each chunk read its 8-byte header and seek past unwanted
+    /// payloads. Only the "ID3 " chunk's payload is actually loaded —
+    /// avoiding the multi-GB read that `Data(contentsOf:, .mappedIfSafe)`
+    /// triggers on non-local volumes.
     static func read(_ url: URL) throws -> AIFFFile {
-        let data = try Data(contentsOf: url, options: .mappedIfSafe)
-        guard data.count >= 12 else { throw AIFFError.truncated }
-        guard data[0] == 0x46, data[1] == 0x4F, data[2] == 0x52, data[3] == 0x4D
+        let h = try FileHandle(forReadingFrom: url)
+        defer { try? h.close() }
+        let fileSize = (try? h.seekToEnd()) ?? 0
+        try h.seek(toOffset: 0)
+
+        let head = h.readData(ofLength: 12)
+        guard head.count == 12 else { throw AIFFError.truncated }
+        guard head[0] == 0x46, head[1] == 0x4F,
+              head[2] == 0x52, head[3] == 0x4D
         else { throw AIFFError.notAIFF }                           // "FORM"
-        let formType = String(data: data.subdata(in: 8..<12), encoding: .ascii) ?? ""
+        let formType = String(data: head.subdata(in: 8..<12), encoding: .ascii) ?? ""
         guard formType == "AIFF" || formType == "AIFC" else { throw AIFFError.notAIFF }
 
-        var p = 12
+        var p: UInt64 = 12
         var id3: Data?
-        while p + 8 <= data.count {
-            let id = String(data: data.subdata(in: p..<p+4), encoding: .ascii) ?? ""
-            let size = Int(beU32(data, p + 4))
+        while p + 8 <= fileSize {
+            try h.seek(toOffset: p)
+            let chunkHeader = h.readData(ofLength: 8)
+            guard chunkHeader.count == 8 else { break }
+            let id = String(data: chunkHeader.prefix(4), encoding: .ascii) ?? ""
+            let size = Int(beU32(chunkHeader, 4))
             let payloadStart = p + 8
-            let payloadEnd = payloadStart + size
-            guard payloadEnd <= data.count else { break }
+            let payloadEnd = payloadStart + UInt64(size)
+            guard payloadEnd <= fileSize else { break }
             if id == "ID3 " {
-                id3 = data.subdata(in: payloadStart..<payloadEnd)
+                id3 = h.readData(ofLength: size)
+                if id3?.count != size { id3 = nil; break }
             }
             // Advance past payload + 1-byte pad if odd.
-            p = payloadEnd + (size & 1)
+            p = payloadEnd + UInt64(size & 1)
         }
         return AIFFFile(url: url, id3Chunk: id3)
     }

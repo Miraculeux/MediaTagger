@@ -34,17 +34,26 @@ struct DFFFile {
 
     // MARK: - Read
 
+    /// Stream FRM8 children via `FileHandle`. DSDIFF audio (`DSD ` chunk) is
+    /// the bulk of the file (multi-GB on DSD256 albums); we only need to
+    /// read its 12-byte chunk header to learn its size, never its payload.
+    /// `Data(contentsOf: .mappedIfSafe)` quietly falls back to a full file
+    /// copy on non-local volumes, which made sidebar prefetch O(file_bytes).
     static func read(_ url: URL) throws -> DFFFile {
-        let data = try Data(contentsOf: url, options: .mappedIfSafe)
-        guard data.count >= 16,
-              data[0] == 0x46, data[1] == 0x52, data[2] == 0x4D, data[3] == 0x38
+        let h = try FileHandle(forReadingFrom: url)
+        defer { try? h.close() }
+        let fileSize = (try? h.seekToEnd()) ?? 0
+        try h.seek(toOffset: 0)
+
+        let head = h.readData(ofLength: 16)
+        guard head.count == 16,
+              head[0] == 0x46, head[1] == 0x52,
+              head[2] == 0x4D, head[3] == 0x38
         else { throw DFFError.notDFF }                              // "FRM8"
-        let formType = String(data: data.subdata(in: 12..<16), encoding: .ascii) ?? ""
+        let formType = String(data: head.subdata(in: 12..<16), encoding: .ascii) ?? ""
         guard formType == "DSD " else { throw DFFError.notDFF }
 
-        // Walk top-level chunks of FRM8 starting after the 16-byte header.
-        // We extract both the ID3 tag and PROP/SND tech info in this single pass.
-        var p = 16
+        var p: UInt64 = 16
         var id3: Data?
         var tech = MediaTechnicalInfo()
         tech.container = "DFF"
@@ -52,25 +61,33 @@ struct DFFFile {
         tech.isDSD = true
         var dsdDataSize: UInt64 = 0
 
-        while p + 12 <= data.count {
-            let id = String(data: data.subdata(in: p..<p+4), encoding: .ascii) ?? ""
-            let size = Int(beU64(data, p + 4))
+        while p + 12 <= fileSize {
+            try h.seek(toOffset: p)
+            let chunkHeader = h.readData(ofLength: 12)
+            guard chunkHeader.count == 12 else { break }
+            let id = String(data: chunkHeader.prefix(4), encoding: .ascii) ?? ""
+            let size = UInt64(beU64(chunkHeader, 4))
             let payloadStart = p + 12
-            let payloadEnd = min(payloadStart + size, data.count)
+            let payloadEnd = min(payloadStart + size, fileSize)
+            let payloadLen = Int(payloadEnd - payloadStart)
             switch id {
             case "ID3 ":
-                id3 = data.subdata(in: payloadStart..<payloadEnd)
-            case "PROP":
-                if payloadEnd - payloadStart >= 4,
-                   String(data: data.subdata(in: payloadStart..<payloadStart+4),
-                          encoding: .ascii) == "SND " {
-                    parseSND(data, start: payloadStart + 4, end: payloadEnd, into: &tech)
+                id3 = h.readData(ofLength: payloadLen)
+                if id3?.count != payloadLen { id3 = nil }
+            case "PROP" where payloadLen >= 4:
+                // PROP/SND is typically <200 bytes — read the whole payload.
+                let body = h.readData(ofLength: payloadLen)
+                if body.count >= 4,
+                   String(data: body.prefix(4), encoding: .ascii) == "SND " {
+                    parseSND(body, start: 4, end: body.count, into: &tech)
                 }
             case "DSD ":
-                dsdDataSize = UInt64(size)
-            default: break
+                // Skip the audio payload entirely — only the size matters.
+                dsdDataSize = size
+            default:
+                break  // skipped via seek on next iteration
             }
-            p = payloadEnd + (size & 1)        // 1-byte pad if odd
+            p = payloadEnd + UInt64(size & 1)        // 1-byte pad if odd
         }
 
         if let sr = tech.sampleRate, let ch = tech.channels, sr > 0, ch > 0 {
@@ -129,10 +146,18 @@ struct DFFFile {
     /// Streams non-ID3 chunks through a `FileHandle` instead of buffering
     /// them in memory. A multi-GB DSD file edited for tags only does one
     /// sequential pass plus a small ID3 write.
+    ///
+    /// Fast path: if the file has no ID3 chunk (or has exactly one and it
+    /// is the **last** child of FRM8 — by far the common case, since every
+    /// mainstream tagger appends ID3 there), we truncate at the old ID3's
+    /// start and append the new one in place, then patch the 8-byte FRM8
+    /// size field. This avoids rewriting the multi-GB `DSD ` audio chunk.
+    /// Net IO drops from ~filesize down to ~tag size.
     static func write(url: URL,
                       entries: [(key: String, value: String)],
                       cover: (data: Data, mime: String)?) throws {
-        // Pass 1: read header + walk chunk headers to build the keep-list.
+        // Pass 1: read header + walk chunk headers to build the keep-list
+        // and detect whether an in-place truncate+append is safe.
         let src = try FileHandle(forReadingFrom: url)
         defer { try? src.close() }
 
@@ -148,6 +173,9 @@ struct DFFFile {
         struct ChunkRange { let offset: UInt64; let length: UInt64 }
         var keepRanges: [ChunkRange] = []
         var keepBytes: UInt64 = 0
+        var id3ChunkCount = 0
+        var lastID3Start: UInt64? = nil
+        var lastChunkWasID3 = false
         var p: UInt64 = 16
 
         while p + 12 <= totalFileSize {
@@ -160,10 +188,15 @@ struct DFFFile {
             guard payloadEnd <= totalFileSize else { break }
             let chunkEnd = payloadEnd + (size & 1)
             let actualEnd = min(chunkEnd, totalFileSize)
-            if id != "ID3 " {
+            if id == "ID3 " {
+                id3ChunkCount += 1
+                lastID3Start = p
+                lastChunkWasID3 = true
+            } else {
                 let length = actualEnd - p
                 keepRanges.append(ChunkRange(offset: p, length: length))
                 keepBytes += length
+                lastChunkWasID3 = false
             }
             p = chunkEnd
         }
@@ -171,9 +204,38 @@ struct DFFFile {
         let newID3 = encodedID3(entries: entries, cover: cover)
         let id3PaddingByte: UInt64 = (UInt64(newID3.count) & 1) == 1 ? 1 : 0
         let newID3Total: UInt64 = 12 + UInt64(newID3.count) + id3PaddingByte
-        let formPayloadSize: UInt64 = 4 + keepBytes + newID3Total
 
-        // Pass 2: stream output.
+        // In-place fast path: append-or-replace-tail.
+        let canInPlace = (id3ChunkCount == 0) || (id3ChunkCount == 1 && lastChunkWasID3)
+        if canInPlace {
+            // bodyEnd = byte offset where the new ID3 chunk should start.
+            // - No existing ID3:   append at current EOF.
+            // - Trailing ID3:      truncate it off and append at its start.
+            let bodyEnd: UInt64 = lastID3Start ?? totalFileSize
+            let newFileSize: UInt64 = bodyEnd + newID3Total
+            let newFormPayloadSize: UInt64 = newFileSize - 12
+
+            let h = try FileHandle(forUpdating: url)
+            defer { try? h.close() }
+
+            if totalFileSize != bodyEnd {
+                try h.truncate(atOffset: bodyEnd)
+            }
+            try h.seek(toOffset: bodyEnd)
+            try h.write(contentsOf: Data("ID3 ".utf8))
+            try h.write(contentsOf: beU64Bytes(UInt64(newID3.count)))
+            try h.write(contentsOf: newID3)
+            if id3PaddingByte == 1 { try h.write(contentsOf: Data([0])) }
+
+            // Patch FRM8 size (8 BE at offset 4).
+            try h.seek(toOffset: 4)
+            try h.write(contentsOf: beU64Bytes(newFormPayloadSize))
+            return
+        }
+
+        // Slow path: ID3 chunk lives somewhere in the middle, or the file
+        // has multiple stale ID3 chunks. Stream a full rewrite to clean up.
+        let formPayloadSize: UInt64 = 4 + keepBytes + newID3Total
         try IOStreaming.writeAtomically(to: url) { tmpURL in
             let dest = try FileHandle(forWritingTo: tmpURL)
             defer { try? dest.close() }

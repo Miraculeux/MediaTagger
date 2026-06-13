@@ -33,9 +33,29 @@ struct ID3v2File {
 
     // MARK: Read
 
+    /// Stream the ID3v2 tag header + frames via `FileHandle`. We never load
+    /// the audio body during a read (sidebar title prefetch + tag editor
+    /// don't need it), so retitling pre-flight on a 500 MB MP3 reads ~tag
+    /// size, not the whole file.
     static func read(_ url: URL) throws -> ID3v2File {
-        let data = try Data(contentsOf: url, options: .mappedIfSafe)
-        return try parse(data, url: url)
+        let h = try FileHandle(forReadingFrom: url)
+        defer { try? h.close() }
+        let head = h.readData(ofLength: 10)
+        let hasID3 = head.count >= 10
+            && head[0] == 0x49 && head[1] == 0x44 && head[2] == 0x33
+        guard hasID3 else {
+            // No ID3v2 prefix. `body` is intentionally empty here; the only
+            // callers that need the body bytes (write paths) construct the
+            // file via `parse(_:url:)` on the full data they already have.
+            return ID3v2File(url: url, frames: [], body: Data())
+        }
+        let tagSize = Int(syncsafe(head[6], head[7], head[8], head[9]))
+        try h.seek(toOffset: 0)
+        let tag = h.readData(ofLength: 10 + tagSize)
+        guard tag.count == 10 + tagSize else { throw ID3Error.truncated }
+        // Reuse the existing parser; the body field will be empty for the
+        // file-handle path (parse fills it with everything past the tag).
+        return try parse(tag, url: url)
     }
 
     static func parse(_ data: Data, url: URL) throws -> ID3v2File {
@@ -209,7 +229,33 @@ struct ID3v2File {
             newFrames.append(ID3Frame(id: "APIC", data: ID3Frame.encodeAPIC(data: cover.data, mime: cover.mime)))
         }
 
-        let tag = encodeTag(frames: newFrames, padding: 1024)
+        // Try in-place patch first: if the new tag (with generous padding)
+        // fits inside the slot the old tag occupied (`bodyOffset` bytes
+        // before the audio frames), we can just overwrite those bytes via
+        // `FileHandle` and skip the multi-GB audio rewrite entirely. We
+        // also generously bump the default padding to 64 KiB so subsequent
+        // small edits (cover swap, title tweak, …) keep hitting this path.
+        let defaultPadding = 64 * 1024
+        let preferredTag = encodeTag(frames: newFrames, padding: defaultPadding)
+        if bodyOffset > 0, preferredTag.count <= bodyOffset {
+            // Pad to exactly `bodyOffset` so the on-disk offset is unchanged.
+            let extraPadding = bodyOffset - preferredTag.count
+            let tag = encodeTag(frames: newFrames, padding: defaultPadding + extraPadding)
+            precondition(tag.count == bodyOffset, "in-place ID3 tag must match slot size")
+            do {
+                let h = try FileHandle(forUpdating: url)
+                defer { try? h.close() }
+                try h.seek(toOffset: 0)
+                try h.write(contentsOf: tag)
+            } catch {
+                throw ID3Error.writeFailed(error.localizedDescription)
+            }
+            return
+        }
+
+        // Fall back to a full rewrite — but stamp 64 KiB of padding so the
+        // *next* edit will land in the in-place path above.
+        let tag = preferredTag
 
         let totalSize = IOStreaming.fileSize(of: url)
         let bodyBytes = totalSize > UInt64(bodyOffset) ? totalSize - UInt64(bodyOffset) : 0

@@ -61,11 +61,63 @@ struct FlacFile {
 
     // MARK: Reading
 
+    /// Stream the FLAC metadata area via `FileHandle` so opening a folder
+    /// of multi-hundred-MB FLACs on a slow external/network volume only
+    /// reads ~a few KB per file (or up to the size of an embedded cover).
+    /// `Data(contentsOf:, .mappedIfSafe)` silently falls back to a full
+    /// file copy on non-local volumes, which made sidebar title precompute
+    /// O(album_bytes) instead of O(metadata_bytes).
     static func read(_ url: URL) throws -> FlacFile {
-        let data = try Data(contentsOf: url, options: .mappedIfSafe)
-        return try parse(data, url: url)
+        let handle = try FileHandle(forReadingFrom: url)
+        defer { try? handle.close() }
+
+        // Optional ID3v2 prefix: peek 10 bytes, parse syncsafe size, then
+        // read the whole tag back in (we preserve it verbatim on write).
+        var prefix = Data()
+        var startOffset = 0
+        let head = handle.readData(ofLength: 10)
+        if head.count >= 10, head[0] == 0x49, head[1] == 0x44, head[2] == 0x33 {
+            let flags = head[5]
+            let tagSize = Int(head[6] & 0x7F) << 21
+                | Int(head[7] & 0x7F) << 14
+                | Int(head[8] & 0x7F) << 7
+                | Int(head[9] & 0x7F)
+            let footer = (flags & 0x10) != 0 ? 10 : 0
+            let totalID3 = 10 + tagSize + footer
+            try handle.seek(toOffset: 0)
+            prefix = handle.readData(ofLength: totalID3)
+            guard prefix.count == totalID3 else { throw FlacError.truncated }
+            startOffset = totalID3
+        } else {
+            try handle.seek(toOffset: UInt64(startOffset))
+        }
+
+        let marker = handle.readData(ofLength: 4)
+        guard marker.count == 4,
+              marker[0] == 0x66, marker[1] == 0x4C,
+              marker[2] == 0x61, marker[3] == 0x43
+        else { throw FlacError.notFlac }
+
+        var blocks: [FlacBlock] = []
+        var p = startOffset + 4
+        while true {
+            let header = handle.readData(ofLength: 4)
+            guard header.count == 4 else { throw FlacError.truncated }
+            let isLast = (header[0] & 0x80) != 0
+            let type = header[0] & 0x7F
+            let len = (Int(header[1]) << 16) | (Int(header[2]) << 8) | Int(header[3])
+            p += 4
+            let body = handle.readData(ofLength: len)
+            guard body.count == len else { throw FlacError.truncated }
+            blocks.append(FlacBlock(isLast: isLast, type: type, data: body))
+            p += len
+            if isLast { break }
+        }
+        return FlacFile(url: url, blocks: blocks, audioOffset: p, id3Prefix: prefix)
     }
 
+    /// Parse a FLAC file from an in-memory `Data` buffer. Retained for tests
+    /// and the few code paths that already have the full bytes in memory.
     static func parse(_ data: Data, url: URL) throws -> FlacFile {
         var prefix = Data()
         var startOffset = 0
@@ -165,6 +217,12 @@ struct FlacFile {
     /// Serialise blocks back to a `Data` of header+blocks (without audio frames),
     /// fixing the last-block flag and padding the metadata area to minimise
     /// rewriting of audio data when possible.
+    ///
+    /// Default padding is **256 KiB**: large enough to absorb a typical embedded
+    /// cover (~50–500 KB JPEG) plus future tag tweaks in-place, so a single
+    /// audio-body rewrite happens at most once per file. Cost on disk is
+    /// negligible compared to multi-MB audio bodies, and FLAC players ignore
+    /// padding bytes entirely.
     func encodeMetadataArea(targetSize: Int? = nil) -> Data {
         var normalized = blocks
         // Strip existing padding; we'll add a single padding block at end.
@@ -177,7 +235,7 @@ struct FlacFile {
             body.append(b.data)
         }
         let nonPaddingSize = body.count
-        let target = targetSize ?? (nonPaddingSize + 4 + 4096) // 4 KiB padding by default
+        let target = targetSize ?? (nonPaddingSize + 4 + 256 * 1024)
         let paddingPayloadSize = max(0, target - nonPaddingSize - 4)
         body.append(encodeBlockHeader(isLast: true, type: FlacBlockType.padding, length: paddingPayloadSize))
         body.append(Data(count: paddingPayloadSize))

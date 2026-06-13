@@ -100,46 +100,53 @@ struct DSFFile {
 
     // MARK: - Write
 
+    /// Patch the embedded ID3v2 tag in-place. DSF stores the tag at the end
+    /// of the file with its offset recorded in the 28-byte DSD chunk header
+    /// (`metadataPointer` at bytes 20..28). We therefore:
+    ///   1. Open the file for updating (no temp-file rewrite).
+    ///   2. Truncate at the existing `bodyEnd` (= offset of old tag, or EOF).
+    ///   3. Append the new tag.
+    ///   4. Patch `totalFileSize` + `metadataPointer` in the DSD header.
+    ///
+    /// Net IO for a 600 MB DSD album is now ~a few KB instead of 1.2 GB,
+    /// and the audio bytes are never read or written. The same approach is
+    /// used by foobar2000 / dBpoweramp.
     static func write(url: URL,
                       entries: [(key: String, value: String)],
                       cover: (data: Data, mime: String)?) throws {
-        // Read just the 28-byte DSD chunk header to validate the format
-        // and locate the metadata pointer; the rest is streamed.
-        let src = try FileHandle(forReadingFrom: url)
-        defer { try? src.close() }
-        var header = try src.read(upToCount: 28) ?? Data()
+        let h = try FileHandle(forUpdating: url)
+        defer { try? h.close() }
+
+        try h.seek(toOffset: 0)
+        var header = h.readData(ofLength: 28)
         guard header.count == 28,
               header[0] == 0x44, header[1] == 0x53,
               header[2] == 0x44, header[3] == 0x20
         else { throw DSFError.notDSF }
 
-        let totalFileSize = IOStreaming.fileSize(of: url)
+        let totalFileSize = (try? h.seekToEnd()) ?? 0
         let oldMetaPtr = leU64(header, 20)
         let bodyEnd: UInt64 = (oldMetaPtr > 0 && oldMetaPtr <= totalFileSize)
             ? oldMetaPtr : totalFileSize
 
         let id3 = encodedID3(entries: entries, cover: cover)
 
-        // Compute new totals up front so we can write the patched DSD header
-        // first instead of buffering the whole file in memory.
-        let preservedBytes = bodyEnd - 28 // bytes from offset 28 up to old ID3 (or EOF)
-        let newMetaPtr: UInt64 = bodyEnd
-        let newTotalSize: UInt64 = bodyEnd + UInt64(id3.count)
+        // 1) Truncate any existing ID3 tag (or trailing junk past bodyEnd).
+        if totalFileSize != bodyEnd {
+            try h.truncate(atOffset: bodyEnd)
+        }
 
-        // Patch header in memory (28 bytes) before writing it out.
+        // 2) Append the new tag at bodyEnd.
+        try h.seek(toOffset: bodyEnd)
+        try h.write(contentsOf: id3)
+
+        // 3) Patch DSD header (bytes 12..28) with new totals.
+        let newMetaPtr: UInt64 = id3.isEmpty ? 0 : bodyEnd
+        let newTotalSize: UInt64 = bodyEnd + UInt64(id3.count)
         header.replaceSubrange(12..<20, with: leU64Bytes(newTotalSize))
         header.replaceSubrange(20..<28, with: leU64Bytes(newMetaPtr))
-
-        try IOStreaming.writeAtomically(to: url) { tmpURL in
-            let dest = try FileHandle(forWritingTo: tmpURL)
-            defer { try? dest.close() }
-            try dest.write(contentsOf: header)
-            if preservedBytes > 0 {
-                try src.seek(toOffset: 28)
-                try IOStreaming.stream(from: src, into: dest, byteCount: preservedBytes)
-            }
-            try dest.write(contentsOf: id3)
-        }
+        try h.seek(toOffset: 0)
+        try h.write(contentsOf: header)
     }
 
     private static func encodedID3(entries: [(key: String, value: String)],
