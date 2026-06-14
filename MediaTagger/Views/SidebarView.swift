@@ -18,7 +18,9 @@ struct SidebarView: View {
                 VStack(spacing: 0) {
                     toolbar
                     Divider()
-                    if searchText.isEmpty {
+                    if let hits = appState.coverlessFolders {
+                        coverlessResults(hits: hits)
+                    } else if searchText.isEmpty {
                         List(selection: Binding(
                             get: { appState.selectedFolder },
                             set: { if let url = $0 { appState.loadFiles(in: url) } }
@@ -116,8 +118,72 @@ struct SidebarView: View {
         }
     }
 
+    /// "Folders without cover" scan-result list. Shown above the folder tree
+    /// after the user runs the context-menu action. The user can click any
+    /// row to navigate into that folder (selecting it loads its files into
+    /// the middle pane just like a normal tree click), right-click for the
+    /// usual folder actions, or dismiss the entire list with the ✕ button.
+    @ViewBuilder
+    private func coverlessResults(hits: [URL]) -> some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 6) {
+                Image(systemName: "photo.badge.exclamationmark")
+                    .foregroundStyle(.orange)
+                Text("\(hits.count) folder\(hits.count == 1 ? "" : "s") without cover")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button {
+                    appState.clearCoverlessFolders()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Close scan results")
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            Divider()
+            if hits.isEmpty {
+                VStack(spacing: 8) {
+                    Image(systemName: "checkmark.seal.fill")
+                        .font(.title2)
+                        .foregroundStyle(.green)
+                    Text("Every folder has a cover")
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List(selection: Binding(
+                    get: { appState.selectedFolder },
+                    set: { if let url = $0 { appState.loadFiles(in: url) } }
+                )) {
+                    ForEach(hits, id: \.self) { url in
+                        VStack(alignment: .leading, spacing: 1) {
+                            Label(url.lastPathComponent, systemImage: "folder")
+                            if let scanRoot = appState.coverlessScanRoot,
+                               let relative = relativePath(of: url, root: scanRoot) {
+                                Text(relative)
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                            }
+                        }
+                        .tag(url)
+                        .contextMenu { folderContextMenu(for: url) }
+                    }
+                }
+                .listStyle(.sidebar)
+            }
+        }
+    }
+
     /// Force a full re-scan of the folder tree and the currently selected folder.
     private func refresh() {
+        // Refresh button also dismisses any stale scan-results panel.
+        appState.clearCoverlessFolders()
         if let url = appState.rootURL {
             rootNode = FolderNode(url: url)
         }
@@ -156,9 +222,13 @@ struct SidebarView: View {
     /// the user picks a different root folder.
     private func syncRoot() {
         if let url = appState.rootURL {
-            if rootNode?.url != url { rootNode = FolderNode(url: url) }
+            if rootNode?.url != url {
+                rootNode = FolderNode(url: url)
+                appState.clearCoverlessFolders()
+            }
         } else {
             rootNode = nil
+            appState.clearCoverlessFolders()
         }
     }
 
@@ -169,7 +239,14 @@ struct SidebarView: View {
         Button("Reveal in Finder") {
             NSWorkspace.shared.activateFileViewerSelecting([url])
         }
+        Button("Reveal in Seeker") {
+            revealInSeeker(url)
+        }
         Divider()
+        Button("Find Folders Without Cover…") {
+            appState.findCoverlessFolders(under: url)
+        }
+        .disabled(appState.batchInProgress)
         Button("Auto-repair Covers in Subfolders…") {
             confirmAndRepairCovers(under: url)
         }
@@ -178,6 +255,18 @@ struct SidebarView: View {
             confirmAndNormalizeCovers(under: url)
         }
         .disabled(appState.batchInProgress)
+    }
+
+    /// Open the folder in the Seeker app via its `seeker://reveal` URL
+    /// scheme. Mirrors the file-list row's "Reveal in Seeker" action so
+    /// folder browsing has the same shortcut.
+    private func revealInSeeker(_ url: URL) {
+        var comps = URLComponents()
+        comps.scheme = "seeker"
+        comps.host = "reveal"
+        comps.queryItems = [URLQueryItem(name: "path", value: url.path)]
+        guard let target = comps.url else { return }
+        NSWorkspace.shared.open(target)
     }
 
     /// Show a small confirmation alert (the operation rewrites tag chunks

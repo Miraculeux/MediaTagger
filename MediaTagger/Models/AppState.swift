@@ -33,6 +33,15 @@ final class AppState: ObservableObject {
     /// Cleared automatically when the task completes.
     private var batchTask: Task<Void, Never>?
 
+    /// Result of the most recent "Find Folders Without Cover" scan. While
+    /// non-nil the sidebar displays the list instead of the folder tree.
+    /// Cleared via `clearCoverlessFolders()` (sidebar dismiss button).
+    @Published var coverlessFolders: [URL]?
+    /// Root that the current `coverlessFolders` list was scanned under.
+    /// Used by the sidebar to show "X folders under Y" and to compute
+    /// short relative paths for each row.
+    @Published var coverlessScanRoot: URL?
+
     // Status / errors
     @Published var lastError: String?
     @Published var isDirty: Bool = false
@@ -727,6 +736,123 @@ final class AppState: ObservableObject {
         batchTask?.cancel()
     }
 
+    // MARK: - Find folders without cover
+
+    /// Recursively walk every subdirectory under `root`, sample the first
+    /// audio file in each (alphabetical), and collect directories whose
+    /// first track is missing an embedded cover. Result is published to
+    /// `coverlessFolders` so the sidebar can switch into "scan-results"
+    /// mode; the user clicks a row to navigate into that folder. The
+    /// sampling rule mirrors `autoRepairCovers` so the two features see
+    /// the same set of "needs-cover" directories.
+    func findCoverlessFolders(under root: URL) {
+        guard !batchInProgress else { return }
+        batchInProgress = true
+        batchProgress = 0
+        batchDescription = "Scanning \(root.lastPathComponent)…"
+        lastError = nil
+
+        let service = metadataService
+        let rootURL = root
+        let isExternal = isURLOnExternalVolume(root)
+        let maxConcurrent = isExternal ? 2 : 4
+
+        batchTask = Task.detached { [weak self] in
+            let dirs = await Self.collectAudioDirs(under: rootURL)
+            let total = dirs.count
+            guard total > 0 else {
+                await MainActor.run {
+                    self?.batchInProgress = false
+                    self?.batchDescription = ""
+                    self?.batchTask = nil
+                    self?.lastError = "No music files found under \(rootURL.lastPathComponent)"
+                }
+                return
+            }
+            if Task.isCancelled {
+                await MainActor.run {
+                    self?.batchInProgress = false
+                    self?.batchDescription = ""
+                    self?.batchTask = nil
+                }
+                return
+            }
+            await MainActor.run {
+                self?.batchDescription = "Checking \(total) folder\(total == 1 ? "" : "s") for missing cover…"
+            }
+
+            // Probe each dir concurrently (read-only, no writes).
+            var completed = 0
+            var hits: [URL] = []
+            await withTaskGroup(of: (URL, Bool).self) { group in
+                var iter = dirs.makeIterator()
+                func enqueueNext() {
+                    guard !Task.isCancelled, let dir = iter.next() else { return }
+                    group.addTask {
+                        return (dir, Self.firstAudioFileMissingCover(in: dir, service: service))
+                    }
+                }
+                for _ in 0..<maxConcurrent { enqueueNext() }
+                while let (dir, missing) = await group.next() {
+                    if Task.isCancelled { group.cancelAll(); continue }
+                    completed += 1
+                    if missing { hits.append(dir) }
+                    let p = Double(completed) / Double(total)
+                    await MainActor.run { self?.batchProgress = p }
+                    enqueueNext()
+                }
+            }
+
+            let wasCancelled = Task.isCancelled
+            // Sort hits in localized-standard order so the sidebar list is
+            // predictable across runs.
+            let sorted = hits.sorted {
+                $0.path.localizedStandardCompare($1.path) == .orderedAscending
+            }
+            await MainActor.run {
+                guard let self else { return }
+                self.batchInProgress = false
+                self.batchProgress = 0
+                self.batchDescription = ""
+                self.batchTask = nil
+                self.coverlessFolders = sorted
+                self.coverlessScanRoot = rootURL
+                if wasCancelled {
+                    self.lastError = "Scan cancelled (\(completed)/\(total) folders)"
+                }
+            }
+        }
+    }
+
+    func clearCoverlessFolders() {
+        coverlessFolders = nil
+        coverlessScanRoot = nil
+    }
+
+    /// True if `dir`'s first audio file (alphabetical) has no embedded
+    /// cover. Returns false on read errors so we don't flag unreadable
+    /// directories as needing repair. Directories without any audio files
+    /// also return false — they're not interesting in this list.
+    private nonisolated static func firstAudioFileMissingCover(
+        in dir: URL,
+        service: MetadataService
+    ) -> Bool {
+        let fm = FileManager.default
+        guard let items = try? fm.contentsOfDirectory(
+            at: dir,
+            includingPropertiesForKeys: nil,
+            options: [.skipsHiddenFiles, .skipsSubdirectoryDescendants]
+        ) else { return false }
+        let audio = items
+            .filter { MediaFile.isSupported($0) && !MediaFile.isImage($0) }
+            .sorted {
+                $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending
+            }
+        guard let first = audio.first else { return false }
+        guard let md = try? service.read(first) else { return false }
+        return md.coverArt == nil
+    }
+
     // MARK: - Normalize embedded covers (Sony-compatibility pass)
 
     /// Recursively walk every subdirectory under `root` and re-encode any
@@ -874,7 +1000,8 @@ final class AppState: ObservableObject {
             return CoverRepairResult(dir: dir, repairedFiles: 0, status: .noCandidate)
         }
 
-        if isCoverConforming(existingCover, declaredMime: firstMd.coverMimeType) {
+        if isCoverConforming(existingCover, declaredMime: firstMd.coverMimeType)
+           && isAPICEncodingOK(file: first) {
             return CoverRepairResult(dir: dir, repairedFiles: 0, status: .alreadyCovered)
         }
 
@@ -902,6 +1029,12 @@ final class AppState: ObservableObject {
             }
         }
 
+        // Drop a sidecar cover.jpg next to the audio files. Some Sony
+        // Walkman / Hi-Res Player firmwares ignore embedded covers in DSF
+        // entirely and only display the sidecar; writing one alongside
+        // costs nothing (~200 KB) and unblocks those players.
+        writeSidecarCoverIfMissing(in: dir, normalizedJPEG: normalized)
+
         if repairedCount == 0, let lastErr {
             return CoverRepairResult(dir: dir, repairedFiles: 0, status: .error(lastErr))
         }
@@ -914,6 +1047,9 @@ final class AppState: ObservableObject {
     ///
     /// Returns `true` iff the cover is:
     ///   - actual JPEG bytes (FF D8 FF) — Sony firmware ignores PNG/HEIC
+    ///   - first segment is APP0/JFIF (FF E0). Sony commonly rejects
+    ///     JPEGs that lead with APP1/EXIF — even when the EXIF block is
+    ///     small and the image itself is fine.
     ///   - declared as image/jpeg (with a small slack for missing MIME)
     ///   - <= 1500 px on the long edge
     ///   - <= 600 KB on disk
@@ -921,10 +1057,11 @@ final class AppState: ObservableObject {
         _ data: Data,
         declaredMime: String?
     ) -> Bool {
-        // Magic bytes.
-        guard data.count >= 3,
+        // Magic bytes + first segment marker.
+        guard data.count >= 4,
               data[0] == 0xFF, data[1] == 0xD8, data[2] == 0xFF
         else { return false }
+        if data[3] != 0xE0 { return false }   // APP0 / JFIF only
         // Declared MIME (some writers omit this; tolerate missing/empty,
         // but reject explicit non-JPEG labels like "image/png" since some
         // Sony players key off the field instead of the bytes).
@@ -942,6 +1079,189 @@ final class AppState: ObservableObject {
         else { return false }
         if max(w, h) > 1500 { return false }
         return true
+    }
+
+    /// For ID3v2-bearing containers (MP3/AIFF/DSF/DFF), inspect the APIC
+    /// frame's text-encoding byte AND its description payload. Sony
+    /// Walkman / Hi-Res Player firmware has a long history of refusing
+    /// APIC frames whose description uses encoding 0x01 (UTF-16) or 0x03
+    /// (UTF-8) — even when the description is empty — and some versions
+    /// also drop frames whose description text is non-empty. Only enc=0
+    /// (ISO-8859-1) with an empty description (single null byte) is
+    /// universally accepted. Files using a non-ID3 cover container (FLAC
+    /// PICTURE block, MP4 `covr` atom) are considered OK by this check;
+    /// their own format doesn't have these footguns.
+    private nonisolated static func isAPICEncodingOK(file: URL) -> Bool {
+        let ext = file.pathExtension.lowercased()
+        let raw: Data?
+        switch ext {
+        case "mp3", "aiff", "aif", "aifc":
+            raw = readID3TagBytes(at: file, mode: .id3Prefix)
+        case "dsf":
+            raw = readID3TagBytes(at: file, mode: .dsfTrailer)
+        case "dff":
+            raw = readID3TagBytes(at: file, mode: .dffChunk)
+        default:
+            return true  // FLAC/MP4 — no ID3 APIC encoding to worry about
+        }
+        guard let tag = raw else { return true }  // can't read → don't force rewrite
+        guard let info = apicFrameInfo(in: tag) else { return true }
+        return info.encoding == 0 && info.descriptionEmpty
+    }
+
+    private enum ID3ReadMode {
+        case id3Prefix    // MP3/AIFF: ID3 tag at file head (or in "ID3 " chunk)
+        case dsfTrailer   // DSF: tag at metadataPointer near EOF
+        case dffChunk     // DFF: "ID3 " chunk somewhere inside FRM8
+    }
+
+    /// Returns the raw ID3v2 tag bytes from `file`, or nil if we can't
+    /// find one. Reads only the header + tag — never the audio body.
+    private nonisolated static func readID3TagBytes(at file: URL, mode: ID3ReadMode) -> Data? {
+        guard let h = try? FileHandle(forReadingFrom: file) else { return nil }
+        defer { try? h.close() }
+        switch mode {
+        case .id3Prefix:
+            // For MP3 the tag is at offset 0. For AIFF it's wrapped in an
+            // "ID3 " chunk; locate by walking RIFF/AIFF chunks.
+            if file.pathExtension.lowercased() == "mp3" {
+                let head = h.readData(ofLength: 10)
+                guard head.count == 10, head[0] == 0x49, head[1] == 0x44, head[2] == 0x33 else { return nil }
+                let size = Int(head[6] & 0x7F) << 21 | Int(head[7] & 0x7F) << 14
+                         | Int(head[8] & 0x7F) << 7  | Int(head[9] & 0x7F)
+                try? h.seek(toOffset: 0)
+                let d = h.readData(ofLength: 10 + size)
+                return d.count == 10 + size ? d : nil
+            }
+            // AIFF
+            let formHeader = h.readData(ofLength: 12)
+            guard formHeader.count == 12,
+                  formHeader[0] == 0x46, formHeader[1] == 0x4F,
+                  formHeader[2] == 0x52, formHeader[3] == 0x4D
+            else { return nil }
+            let fileSize = (try? h.seekToEnd()) ?? 0
+            var p: UInt64 = 12
+            while p + 8 <= fileSize {
+                try? h.seek(toOffset: p)
+                let ch = h.readData(ofLength: 8)
+                if ch.count < 8 { return nil }
+                let id = String(data: ch.prefix(4), encoding: .ascii) ?? ""
+                let size = UInt64(UInt32(ch[4]) << 24 | UInt32(ch[5]) << 16
+                                | UInt32(ch[6]) << 8  | UInt32(ch[7]))
+                if id == "ID3 " {
+                    let body = h.readData(ofLength: Int(size))
+                    return body.count == Int(size) ? body : nil
+                }
+                p += 8 + size + (size & 1)
+            }
+            return nil
+
+        case .dsfTrailer:
+            let head = h.readData(ofLength: 28)
+            guard head.count == 28,
+                  head[0] == 0x44, head[1] == 0x53,
+                  head[2] == 0x44, head[3] == 0x20
+            else { return nil }
+            let metaPtr = UInt64(head[20]) | UInt64(head[21]) << 8
+                        | UInt64(head[22]) << 16 | UInt64(head[23]) << 24
+                        | UInt64(head[24]) << 32 | UInt64(head[25]) << 40
+                        | UInt64(head[26]) << 48 | UInt64(head[27]) << 56
+            guard metaPtr > 0 else { return nil }
+            let fileSize = (try? h.seekToEnd()) ?? 0
+            guard metaPtr < fileSize else { return nil }
+            try? h.seek(toOffset: metaPtr)
+            return h.readData(ofLength: Int(fileSize - metaPtr))
+
+        case .dffChunk:
+            let head = h.readData(ofLength: 16)
+            guard head.count == 16,
+                  head[0] == 0x46, head[1] == 0x52,
+                  head[2] == 0x4D, head[3] == 0x38
+            else { return nil }
+            let fileSize = (try? h.seekToEnd()) ?? 0
+            var p: UInt64 = 16
+            while p + 12 <= fileSize {
+                try? h.seek(toOffset: p)
+                let ch = h.readData(ofLength: 12)
+                if ch.count < 12 { return nil }
+                let id = String(data: ch.prefix(4), encoding: .ascii) ?? ""
+                let size = UInt64(ch[4]) << 56 | UInt64(ch[5]) << 48
+                         | UInt64(ch[6]) << 40 | UInt64(ch[7]) << 32
+                         | UInt64(ch[8]) << 24 | UInt64(ch[9]) << 16
+                         | UInt64(ch[10]) << 8 | UInt64(ch[11])
+                if id == "ID3 " {
+                    let body = h.readData(ofLength: Int(size))
+                    return body.count == Int(size) ? body : nil
+                }
+                p += 12 + size + (size & 1)
+            }
+            return nil
+        }
+    }
+
+    /// Returns the encoding byte and description-empty flag of the first
+    /// APIC frame in `tag`, or nil if none. Skips an optional 10-byte
+    /// extended header (v2.3 flag bit 6). The description is considered
+    /// empty when its first byte (for enc 0/3) or first word (for enc 1/2)
+    /// is a null terminator — i.e. no human-readable text.
+    private nonisolated static func apicFrameInfo(
+        in tag: Data
+    ) -> (encoding: UInt8, descriptionEmpty: Bool)? {
+        guard tag.count >= 10,
+              tag[0] == 0x49, tag[1] == 0x44, tag[2] == 0x33
+        else { return nil }
+        let major = tag[3]
+        let flags = tag[5]
+        let tagSize = Int(tag[6] & 0x7F) << 21 | Int(tag[7] & 0x7F) << 14
+                    | Int(tag[8] & 0x7F) << 7  | Int(tag[9] & 0x7F)
+        var p = 10
+        // Skip extended header.
+        if flags & 0x40 != 0, p + 4 <= tag.count {
+            let extSize: Int
+            if major >= 4 {
+                extSize = Int(tag[p] & 0x7F) << 21 | Int(tag[p+1] & 0x7F) << 14
+                        | Int(tag[p+2] & 0x7F) << 7  | Int(tag[p+3] & 0x7F)
+            } else {
+                extSize = Int(tag[p]) << 24 | Int(tag[p+1]) << 16
+                        | Int(tag[p+2]) << 8  | Int(tag[p+3])
+                        + 4
+            }
+            p += extSize
+        }
+        let end = min(10 + tagSize, tag.count)
+        while p + 10 <= end {
+            if tag[p] == 0 { break }
+            let id = String(bytes: tag[p..<p+4], encoding: .ascii) ?? "????"
+            let size: Int
+            if major >= 4 {
+                size = Int(tag[p+4] & 0x7F) << 21 | Int(tag[p+5] & 0x7F) << 14
+                     | Int(tag[p+6] & 0x7F) << 7  | Int(tag[p+7] & 0x7F)
+            } else {
+                size = Int(tag[p+4]) << 24 | Int(tag[p+5]) << 16
+                     | Int(tag[p+6]) << 8  | Int(tag[p+7])
+            }
+            let frameStart = p + 10
+            if id == "APIC", frameStart < end {
+                let enc = tag[frameStart]
+                // Walk past mime (null-terminated ASCII), 1-byte picType,
+                // then peek the first byte(s) of description.
+                var q = frameStart + 1
+                while q < end, tag[q] != 0 { q += 1 }
+                q += 1 // skip mime null
+                guard q < end else { return (enc, false) }
+                q += 1 // skip picType
+                guard q < end else { return (enc, false) }
+                let descEmpty: Bool
+                if enc == 0 || enc == 3 {
+                    descEmpty = tag[q] == 0
+                } else {
+                    descEmpty = q + 1 < end && tag[q] == 0 && tag[q + 1] == 0
+                }
+                return (enc, descEmpty)
+            }
+            p = frameStart + size
+        }
+        return nil
     }
 
     // MARK: - Auto-repair covers — shared helpers
@@ -977,10 +1297,61 @@ final class AppState: ObservableObject {
         return out
     }
 
-    /// Returns the chosen cover image URL for `dir`, or `nil` if no candidate
-    /// matches the priority list. Pure file-naming logic, no IO beyond the
-    /// directory listing.
-    private nonisolated static func pickCoverCandidate(images: [URL], dirName: String) -> URL? {
+    /// Returns the chosen cover image URL, or `nil` if no candidate matches.
+    /// Pure file-naming logic — directory listings are passed in by the
+    /// caller (which already enumerated them once with isDirectoryKey).
+    ///
+    /// Priority:
+    ///   1. `cover.{ext}` in the directory itself
+    ///   2. `封面.{ext}` in the directory itself
+    ///   3. `front.{ext}` in the directory itself
+    ///   4. file whose stem matches the directory name
+    ///   5. first image (alphabetical) in the directory
+    ///   6. any image found one level down in a subfolder whose name
+    ///      (case-insensitive) matches `images` / `图片` / `cover` /
+    ///      `covers` / `封面` / `scans` / `artwork` / `booklet`, applying
+    ///      the same 1..5 sub-priorities within that child folder
+    private nonisolated static func pickCoverCandidate(
+        dirName: String,
+        directImages: [URL],
+        subdirs: [URL]
+    ) -> URL? {
+        if let u = pickByPriority(images: directImages, dirName: dirName) {
+            return u
+        }
+
+        // Peek one level down into well-known image subfolder names.
+        let imageSubfolderNames: Set<String> = [
+            "images", "图片",
+            "cover", "covers", "封面",
+            "scans", "scan",
+            "artwork", "art",
+            "booklet",
+        ]
+        let matching = subdirs.filter {
+            imageSubfolderNames.contains($0.lastPathComponent.lowercased())
+        }
+        if matching.isEmpty { return nil }
+
+        let fm = FileManager.default
+        for subdir in matching.sorted(by: {
+            $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending
+        }) {
+            guard let kids = try? fm.contentsOfDirectory(
+                at: subdir,
+                includingPropertiesForKeys: nil,
+                options: [.skipsHiddenFiles, .skipsSubdirectoryDescendants]
+            ) else { continue }
+            let imgs = kids.filter { MediaFile.isImage($0) }
+            if let u = pickByPriority(images: imgs, dirName: dirName) {
+                return u
+            }
+        }
+        return nil
+    }
+
+    /// Internal name-based picker shared by the direct-dir and subdir paths.
+    private nonisolated static func pickByPriority(images: [URL], dirName: String) -> URL? {
         // Common image extensions we'll embed. (Restricted vs. the read-only
         // set in MediaFile.imageExtensions — embedding TIFF/GIF in audio tags
         // works poorly in many players.)
@@ -995,6 +1366,7 @@ final class AppState: ObservableObject {
             }
         }
         if let u = firstMatching("cover") { return u }
+        if let u = firstMatching("封面") { return u }
         if let u = firstMatching("front") { return u }
         if let u = firstMatching(dirName) { return u }
         return candidates.sorted {
@@ -1007,18 +1379,32 @@ final class AppState: ObservableObject {
         service: MetadataService
     ) async -> CoverRepairResult {
         let fm = FileManager.default
+        // Single listing with .isDirectoryKey pre-fetched so we don't pay
+        // a separate stat per entry later. Partition once into audio /
+        // image / subdirectory buckets.
         guard let items = try? fm.contentsOfDirectory(
             at: dir,
-            includingPropertiesForKeys: nil,
+            includingPropertiesForKeys: [.isDirectoryKey],
             options: [.skipsHiddenFiles, .skipsSubdirectoryDescendants]
         ) else {
             return CoverRepairResult(dir: dir, repairedFiles: 0, status: .noCandidate)
         }
-        let audioFiles = items
-            .filter { MediaFile.isSupported($0) && !MediaFile.isImage($0) }
-            .sorted {
-                $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending
+        var audioFiles: [URL] = []
+        var imageItems: [URL] = []
+        var subdirs: [URL] = []
+        for item in items {
+            let isDir = (try? item.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) ?? false
+            if isDir {
+                subdirs.append(item)
+            } else if MediaFile.isImage(item) {
+                imageItems.append(item)
+            } else if MediaFile.isSupported(item) {
+                audioFiles.append(item)
             }
+        }
+        audioFiles.sort {
+            $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending
+        }
         guard let first = audioFiles.first else {
             return CoverRepairResult(dir: dir, repairedFiles: 0, status: .noCandidate)
         }
@@ -1030,10 +1416,10 @@ final class AppState: ObservableObject {
             return CoverRepairResult(dir: dir, repairedFiles: 0, status: .alreadyCovered)
         }
 
-        let imageItems = items.filter { MediaFile.isImage($0) }
         guard let coverURL = pickCoverCandidate(
-            images: imageItems,
-            dirName: dir.lastPathComponent
+            dirName: dir.lastPathComponent,
+            directImages: imageItems,
+            subdirs: subdirs
         ) else {
             return CoverRepairResult(dir: dir, repairedFiles: 0, status: .noCandidate)
         }
@@ -1067,6 +1453,15 @@ final class AppState: ObservableObject {
             } catch {
                 lastErr = error.localizedDescription
             }
+        }
+
+        // Drop a sidecar cover.jpg next to the audio files. Some Sony
+        // Walkman / Hi-Res Player firmwares ignore embedded covers in DSF
+        // entirely and only display the sidecar; writing one alongside
+        // costs nothing and unblocks those players. We only write JPEG
+        // sidecars (skip when the embed is PNG/HEIC).
+        if mime.contains("jpeg") {
+            writeSidecarCoverIfMissing(in: dir, normalizedJPEG: normalized)
         }
 
         if repairedCount == 0, let lastErr {
@@ -1113,6 +1508,25 @@ final class AppState: ObservableObject {
         case "heic", "heif": return "image/heic"
         default:             return "image/jpeg"
         }
+    }
+
+    /// Write `normalizedJPEG` as `dir/cover.jpg` only if no `cover.{jpg,jpeg}`
+    /// already exists (case-insensitive). Some Sony players ignore the
+    /// embedded APIC entirely (notably with DSF) and only honor a sidecar;
+    /// users who curated their own sidecar are left alone.
+    private nonisolated static func writeSidecarCoverIfMissing(
+        in dir: URL,
+        normalizedJPEG: Data
+    ) {
+        let fm = FileManager.default
+        let existing = (try? fm.contentsOfDirectory(atPath: dir.path)) ?? []
+        let hasOne = existing.contains {
+            let name = $0.lowercased()
+            return name == "cover.jpg" || name == "cover.jpeg"
+        }
+        if hasOne { return }
+        let dest = dir.appendingPathComponent("cover.jpg")
+        try? normalizedJPEG.write(to: dest, options: .atomic)
     }
 
     // MARK: - Bookmark persistence

@@ -397,12 +397,28 @@ struct ID3Frame {
     }
 
     static func encodeAPIC(data: Data, mime: String) -> Data {
+        // ID3v2.3 APIC layout per spec:
+        //   <text encoding>     1 byte
+        //   <MIME type>         text string $00       (always ASCII / latin-1)
+        //   <picture type>      1 byte
+        //   <description>       text string $00 (00)  (terminator depends on enc)
+        //   <picture data>      binary
+        //
+        // We deliberately use encoding 0x00 (ISO-8859-1) with an empty
+        // description (just the single null terminator). Many embedded
+        // players (Sony Walkman / Hi-Res Player firmware in particular)
+        // have buggy ID3v2 parsers that refuse APIC frames whose
+        // description encoding is 0x01 (UTF-16) — even when the description
+        // payload is just the BOM + null. The description text is never
+        // displayed by any sane player; using encoding 0 here matches what
+        // foobar2000 / Mp3tag / dBpoweramp emit and is the maximum-
+        // compatibility choice.
         var d = Data()
-        d.append(0x01)                       // encoding (for description)
-        d.append(Data(mime.utf8))            // MIME (latin-1/ascii)
-        d.append(0x00)                       // null
+        d.append(0x00)                       // encoding: ISO-8859-1
+        d.append(Data(mime.utf8))            // MIME (ASCII)
+        d.append(0x00)                       // mime null terminator
         d.append(0x03)                       // picture type: front cover
-        d.append(utf16WithBOM(""))           // empty description (BOM + 0x0000)
+        d.append(0x00)                       // empty description + single null
         d.append(data)
         return d
     }
