@@ -42,6 +42,14 @@ final class AppState: ObservableObject {
     /// short relative paths for each row.
     @Published var coverlessScanRoot: URL?
 
+    /// Result of the most recent metadata search. While non-nil the
+    /// sidebar shows the hit list instead of the folder tree.
+    @Published var advancedSearchHits: [AdvancedSearchHit]?
+    /// Root the current search ran under, for the header label.
+    @Published var advancedSearchScanRoot: URL?
+    /// Criteria string for the header ("Album=foo · Artist=bar").
+    @Published var advancedSearchSummary: String = ""
+
     // Status / errors
     @Published var lastError: String?
     @Published var isDirty: Bool = false
@@ -827,6 +835,187 @@ final class AppState: ObservableObject {
     func clearCoverlessFolders() {
         coverlessFolders = nil
         coverlessScanRoot = nil
+    }
+
+    // MARK: - Advanced (metadata) search
+
+    /// One result row for `runAdvancedSearch`. Identifiable by URL so the
+    /// sidebar List can hold its selection across reruns.
+    struct AdvancedSearchHit: Identifiable, Hashable {
+        var id: URL { url }
+        let url: URL
+        let title: String?
+        let artist: String?
+        let album: String?
+    }
+
+    /// Recursively walk `root`, read every audio file's metadata, and keep
+    /// the ones whose ALBUM / ARTIST / TITLE tags contain the given (case-
+    /// insensitive) substrings. Empty criteria are ignored; multiple fields
+    /// AND together. Result is published to `advancedSearchHits` so the
+    /// sidebar can switch into "search-results" mode.
+    func runAdvancedSearch(
+        under root: URL,
+        album: String,
+        artist: String,
+        title: String
+    ) {
+        guard !batchInProgress else { return }
+        let albumQ  = album.trimmingCharacters(in: .whitespacesAndNewlines)
+        let artistQ = artist.trimmingCharacters(in: .whitespacesAndNewlines)
+        let titleQ  = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !(albumQ.isEmpty && artistQ.isEmpty && titleQ.isEmpty) else {
+            lastError = "Enter at least one of album, artist, or title."
+            return
+        }
+
+        batchInProgress = true
+        batchProgress = 0
+        batchDescription = "Searching \(root.lastPathComponent)…"
+        lastError = nil
+
+        let service = metadataService
+        let rootURL = root
+        let summary = [
+            albumQ.isEmpty  ? nil : "Album=\(albumQ)",
+            artistQ.isEmpty ? nil : "Artist=\(artistQ)",
+            titleQ.isEmpty  ? nil : "Title=\(titleQ)",
+        ].compactMap { $0 }.joined(separator: " · ")
+        let isExternal = isURLOnExternalVolume(root)
+        let maxConcurrent = isExternal ? 4 : 8
+
+        batchTask = Task.detached { [weak self] in
+            // 1. Collect all audio files under root (BFS, hidden-file safe).
+            let allFiles = await Self.collectAudioFiles(under: rootURL)
+            let total = allFiles.count
+            guard total > 0 else {
+                await MainActor.run {
+                    self?.batchInProgress = false
+                    self?.batchDescription = ""
+                    self?.batchTask = nil
+                    self?.lastError = "No music files found under \(rootURL.lastPathComponent)"
+                }
+                return
+            }
+            if Task.isCancelled {
+                await MainActor.run {
+                    self?.batchInProgress = false
+                    self?.batchDescription = ""
+                    self?.batchTask = nil
+                }
+                return
+            }
+            await MainActor.run {
+                self?.batchDescription = "Searching \(total) files…"
+            }
+
+            var completed = 0
+            var hits: [AdvancedSearchHit] = []
+
+            await withTaskGroup(of: AdvancedSearchHit?.self) { group in
+                var iter = allFiles.makeIterator()
+                func enqueueNext() {
+                    guard !Task.isCancelled, let file = iter.next() else { return }
+                    group.addTask {
+                        guard let md = try? service.read(file) else { return nil }
+                        if !AppState.matches(md.album, albumQ)   { return nil }
+                        if !AppState.matches(md.artist, artistQ) { return nil }
+                        if !AppState.matches(md.title, titleQ)   { return nil }
+                        return AdvancedSearchHit(
+                            url: file,
+                            title: md.title,
+                            artist: md.artist,
+                            album: md.album)
+                    }
+                }
+                for _ in 0..<maxConcurrent { enqueueNext() }
+                while let hit = await group.next() {
+                    if Task.isCancelled { group.cancelAll(); continue }
+                    completed += 1
+                    if let hit { hits.append(hit) }
+                    let p = Double(completed) / Double(total)
+                    if completed & 0xF == 0 {        // throttle main-thread updates
+                        await MainActor.run { self?.batchProgress = p }
+                    }
+                    enqueueNext()
+                }
+            }
+
+            let wasCancelled = Task.isCancelled
+            // Stable sort: album, then track, then title.
+            let sorted = hits.sorted {
+                let a = ($0.album ?? "").localizedStandardCompare($1.album ?? "")
+                if a != .orderedSame { return a == .orderedAscending }
+                let t = ($0.title ?? "").localizedStandardCompare($1.title ?? "")
+                return t == .orderedAscending
+            }
+            await MainActor.run {
+                guard let self else { return }
+                self.batchInProgress = false
+                self.batchProgress = 0
+                self.batchDescription = ""
+                self.batchTask = nil
+                self.advancedSearchHits = sorted
+                self.advancedSearchScanRoot = rootURL
+                self.advancedSearchSummary = summary
+                if wasCancelled {
+                    self.lastError = "Search cancelled (\(completed)/\(total) files scanned)"
+                }
+            }
+        }
+    }
+
+    func clearAdvancedSearch() {
+        advancedSearchHits = nil
+        advancedSearchScanRoot = nil
+        advancedSearchSummary = ""
+    }
+
+    /// Open the folder containing `hit` and select the file. Used when the
+    /// user clicks a row in the advanced-search results panel.
+    func openSearchHit(_ hit: AdvancedSearchHit) {
+        let parent = hit.url.deletingLastPathComponent()
+        if selectedFolder != parent {
+            loadFiles(in: parent)
+        }
+        // The post-load selection has to wait for files to be repopulated
+        // so the UI's table can highlight the row. loadFiles updates files
+        // synchronously, so we can set the selection right after.
+        setSelection([hit.url])
+    }
+
+    private nonisolated static func matches(_ value: String?, _ query: String) -> Bool {
+        if query.isEmpty { return true }
+        guard let value, !value.isEmpty else { return false }
+        return value.range(of: query, options: [.caseInsensitive, .diacriticInsensitive]) != nil
+    }
+
+    /// BFS the directory tree starting at `root`, returning every supported
+    /// audio/video file (no images). Symlinks not followed; hidden files
+    /// and packages skipped.
+    private nonisolated static func collectAudioFiles(under root: URL) async -> [URL] {
+        let fm = FileManager.default
+        var out: [URL] = []
+        var queue: [URL] = [root]
+        while !queue.isEmpty {
+            if Task.isCancelled { return out }
+            let dir = queue.removeFirst()
+            guard let items = try? fm.contentsOfDirectory(
+                at: dir,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles, .skipsPackageDescendants]
+            ) else { continue }
+            for item in items {
+                let isDir = (try? item.resourceValues(forKeys: [.isDirectoryKey])
+                                  .isDirectory) ?? false
+                if isDir {
+                    queue.append(item)
+                } else if MediaFile.isSupported(item) && !MediaFile.isImage(item) {
+                    out.append(item)
+                }
+            }
+        }
+        return out
     }
 
     /// True if `dir`'s first audio file (alphabetical) has no embedded

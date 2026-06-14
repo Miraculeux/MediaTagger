@@ -11,14 +11,26 @@ struct SidebarView: View {
     /// children rescanned — on every unrelated state change.
     @State private var rootNode: FolderNode?
     @State private var searchText: String = ""
+    @State private var showAdvancedSearch: Bool = false
+    @State private var advAlbum: String = ""
+    @State private var advArtist: String = ""
+    @State private var advTitle: String = ""
+    @FocusState private var advFocus: AdvancedSearchField?
+    private enum AdvancedSearchField { case album, artist, title }
 
     var body: some View {
         Group {
             if let root = appState.rootURL, let node = rootNode {
                 VStack(spacing: 0) {
                     toolbar
+                    if showAdvancedSearch {
+                        Divider()
+                        advancedSearchPanel
+                    }
                     Divider()
-                    if let hits = appState.coverlessFolders {
+                    if let hits = appState.advancedSearchHits {
+                        advancedSearchResults(hits: hits)
+                    } else if let hits = appState.coverlessFolders {
                         coverlessResults(hits: hits)
                     } else if searchText.isEmpty {
                         List(selection: Binding(
@@ -71,6 +83,20 @@ struct SidebarView: View {
                 .buttonStyle(.plain)
                 .help("Clear search")
             }
+            Button {
+                showAdvancedSearch.toggle()
+                if showAdvancedSearch {
+                    DispatchQueue.main.async { advFocus = .album }
+                }
+            } label: {
+                Image(systemName: showAdvancedSearch
+                      ? "line.3.horizontal.decrease.circle.fill"
+                      : "line.3.horizontal.decrease.circle")
+            }
+            .buttonStyle(.borderless)
+            .help("Advanced search (album / artist / title)")
+            .keyboardShortcut("f", modifiers: [.command, .shift])
+            .disabled(appState.rootURL == nil)
             Button(action: refresh) {
                 Image(systemName: "arrow.clockwise")
             }
@@ -79,6 +105,66 @@ struct SidebarView: View {
             .keyboardShortcut("r", modifiers: [.command])
         }
         .padding(8)
+    }
+
+    /// Inline advanced-search panel, shown immediately under the toolbar
+    /// when the filter button is toggled on. Three optional fields
+    /// (Album / Artist / Title) AND together; Return submits, Escape
+    /// hides the panel. Replaces the previous modal sheet so the user
+    /// keeps full visibility of the sidebar while iterating on queries.
+    @ViewBuilder
+    private var advancedSearchPanel: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            advField("Album",  text: $advAlbum,  field: .album)
+            advField("Artist", text: $advArtist, field: .artist)
+            advField("Title",  text: $advTitle,  field: .title)
+            HStack(spacing: 6) {
+                Spacer()
+                Button("Clear") {
+                    advAlbum = ""; advArtist = ""; advTitle = ""
+                }
+                .controlSize(.small)
+                .disabled(advAlbum.isEmpty && advArtist.isEmpty && advTitle.isEmpty)
+                Button("Search") { runAdvancedSearch() }
+                    .controlSize(.small)
+                    .buttonStyle(.borderedProminent)
+                    .disabled(!canRunAdvancedSearch)
+            }
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .background(.quaternary.opacity(0.4))
+    }
+
+    @ViewBuilder
+    private func advField(_ label: String,
+                          text: Binding<String>,
+                          field: AdvancedSearchField) -> some View {
+        HStack(spacing: 6) {
+            Text(label)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(width: 44, alignment: .trailing)
+            TextField("", text: text)
+                .textFieldStyle(.roundedBorder)
+                .controlSize(.small)
+                .focused($advFocus, equals: field)
+                .onSubmit(runAdvancedSearch)
+        }
+    }
+
+    private var canRunAdvancedSearch: Bool {
+        appState.rootURL != nil
+            && !appState.batchInProgress
+            && !(advAlbum.isEmpty && advArtist.isEmpty && advTitle.isEmpty)
+    }
+
+    private func runAdvancedSearch() {
+        guard canRunAdvancedSearch, let root = appState.rootURL else { return }
+        appState.runAdvancedSearch(under: root,
+                                   album: advAlbum,
+                                   artist: advArtist,
+                                   title: advTitle)
     }
 
     @ViewBuilder
@@ -184,10 +270,102 @@ struct SidebarView: View {
     private func refresh() {
         // Refresh button also dismisses any stale scan-results panel.
         appState.clearCoverlessFolders()
+        appState.clearAdvancedSearch()
         if let url = appState.rootURL {
             rootNode = FolderNode(url: url)
         }
         appState.refreshFiles()
+    }
+
+    /// Advanced (metadata) search result list. Rows show track title /
+    /// artist / album; clicking navigates into the containing folder and
+    /// selects the file in the middle pane. The header reports the criteria
+    /// the scan was run with so the user remembers what they asked for.
+    @ViewBuilder
+    private func advancedSearchResults(hits: [AppState.AdvancedSearchHit]) -> some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 6) {
+                Image(systemName: "line.3.horizontal.decrease.circle")
+                    .foregroundStyle(Color.accentColor)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("\(hits.count) match\(hits.count == 1 ? "" : "es")")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                    if !appState.advancedSearchSummary.isEmpty {
+                        Text(appState.advancedSearchSummary)
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                }
+                Spacer()
+                Button {
+                    appState.clearAdvancedSearch()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Close search results")
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 6)
+            Divider()
+            if hits.isEmpty {
+                VStack(spacing: 8) {
+                    Image(systemName: "magnifyingglass")
+                        .font(.title2)
+                        .foregroundStyle(.secondary)
+                    Text("No matches")
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            } else {
+                List(selection: Binding<URL?>(
+                    get: { appState.selectedFile?.url },
+                    set: {
+                        guard let url = $0,
+                              let hit = hits.first(where: { $0.url == url })
+                        else { return }
+                        appState.openSearchHit(hit)
+                    }
+                )) {
+                    ForEach(hits) { hit in
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text(hit.title ?? hit.url.deletingPathExtension().lastPathComponent)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            HStack(spacing: 4) {
+                                if let artist = hit.artist, !artist.isEmpty {
+                                    Text(artist)
+                                }
+                                if (hit.artist?.isEmpty == false) && (hit.album?.isEmpty == false) {
+                                    Text("·")
+                                }
+                                if let album = hit.album, !album.isEmpty {
+                                    Text(album)
+                                }
+                            }
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                        }
+                        .tag(hit.url)
+                        .contextMenu {
+                            Button("Reveal in Finder") {
+                                NSWorkspace.shared.activateFileViewerSelecting([hit.url])
+                            }
+                            Button("Reveal in Seeker") {
+                                revealInSeeker(hit.url)
+                            }
+                        }
+                    }
+                }
+                .listStyle(.sidebar)
+            }
+        }
     }
 
     /// BFS the folder tree collecting nodes whose name contains `query`
@@ -225,10 +403,12 @@ struct SidebarView: View {
             if rootNode?.url != url {
                 rootNode = FolderNode(url: url)
                 appState.clearCoverlessFolders()
+                appState.clearAdvancedSearch()
             }
         } else {
             rootNode = nil
             appState.clearCoverlessFolders()
+            appState.clearAdvancedSearch()
         }
     }
 
