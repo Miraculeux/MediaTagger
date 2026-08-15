@@ -13,8 +13,9 @@ struct MediaTaggerApp: App {
         #if DEBUG && canImport(VLCKit)
         // Stream libVLC's own diagnostics to stderr so issues like "DSF plays
         // but no sound" surface in the Run terminal instead of being silent.
-        VLCLibrary.shared().debugLogging = true
-        VLCLibrary.shared().debugLoggingLevel = 3
+        let consoleLogger = VLCConsoleLogger()
+        consoleLogger.level = .debug
+        VLCLibrary.shared().loggers = [consoleLogger]
         #endif
     }
 

@@ -1,66 +1,181 @@
 import SwiftUI
 import AppKit
 
+private struct FileListRow: Identifiable {
+    let file: MediaFile
+    let title: String?
+    let track: String
+
+    var id: URL { file.id }
+    var fileSortValue: String { file.name }
+    var titleSortValue: String { title ?? "" }
+}
+
+private struct FileListDisplayRow: Identifiable {
+    let id: Int
+    let value: FileListRow
+}
+
+private enum FileListSortField {
+    case file
+    case title
+}
+
 /// Middle pane: list of media files in the selected folder.
 struct FileListView: View {
     @EnvironmentObject var appState: AppState
+    @State private var sortField: FileListSortField = .file
+    @State private var sortAscending = true
 
-    var body: some View {
-        Table(appState.files,
-              selection: Binding(
-                get: { appState.selectedFileIDs },
-                set: { ids in appState.setSelection(ids) })
-        ) {
-            TableColumn("#") { f in
-                Text(appState.tracks[f.url] ?? "")
-                    .font(.system(.body, design: .monospaced))
-                    .foregroundStyle(.secondary)
-            }
-            .width(min: 50, ideal: 60, max: 90)
-            TableColumn("File") { f in
-                HStack {
-                    Image(systemName: icon(for: f.ext))
-                        .foregroundStyle(.tint)
-                    Text(f.name).lineLimit(1)
+    private var rows: [FileListRow] {
+        appState.files.map { file in
+            FileListRow(
+                file: file,
+                title: appState.titles[file.url],
+                track: appState.tracks[file.url] ?? ""
+            )
+        }
+    }
+
+    private var sortedRows: [FileListRow] {
+        rows.sorted { lhs, rhs in
+            var result: ComparisonResult
+            switch sortField {
+            case .file:
+                result = lhs.fileSortValue.localizedStandardCompare(rhs.fileSortValue)
+            case .title:
+                result = lhs.titleSortValue.localizedStandardCompare(rhs.titleSortValue)
+                if result == .orderedSame {
+                    result = lhs.fileSortValue.localizedStandardCompare(rhs.fileSortValue)
                 }
             }
-            TableColumn("Title") { f in
-                Text(appState.titles[f.url] ?? "—")
-                    .foregroundStyle(appState.titles[f.url] == nil ? .secondary : .primary)
-                    .lineLimit(1)
+            if result == .orderedSame {
+                result = lhs.id.path.compare(rhs.id.path)
             }
+            return sortAscending ? result == .orderedAscending : result == .orderedDescending
         }
-        .contextMenu(forSelectionType: URL.self) { ids in
-            // Right-click on a row: ensure the clicked row participates in
-            // the action even if it wasn't already selected.
-            let targets = ids.isEmpty ? appState.selectedFileIDs : ids
-            Button("Reveal in Finder") { revealInFinder(targets) }
-                .disabled(targets.isEmpty)
-            Button("Reveal in Seeker") { revealInSeeker(targets) }
-                .disabled(targets.isEmpty)
+    }
+
+    private var displayRows: [FileListDisplayRow] {
+        sortedRows.enumerated().map { FileListDisplayRow(id: $0.offset, value: $0.element) }
+    }
+
+    private var displaySelection: Binding<Set<Int>> {
+        Binding(
+            get: {
+                Set(displayRows.compactMap { row in
+                    appState.selectedFileIDs.contains(row.value.id) ? row.id : nil
+                })
+            },
+            set: { positions in
+                let fileIDs = Set(displayRows.compactMap { row in
+                    positions.contains(row.id) ? row.value.id : nil
+                })
+                appState.setSelection(fileIDs)
+            }
+        )
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            tableHeader
             Divider()
-            Button("Refresh") { appState.refreshFiles() }
-        }
-        .background {
-            // Hidden ⌘C handler: copies the selected file's title (or its
-            // filename without extension if no title is known). Disabled when
-            // nothing is selected so the shortcut falls through to the system.
-            Button("Copy", action: copySelectedTitle)
-                .keyboardShortcut("c", modifiers: .command)
-                .disabled(appState.selectedFileIDs.isEmpty)
-                .opacity(0)
-                .frame(width: 0, height: 0)
-                .accessibilityHidden(true)
-        }
-        .overlay {
-            if appState.files.isEmpty {
-                ContentUnavailableView(
-                    "No media files",
-                    systemImage: "play.rectangle",
-                    description: Text("Select a folder containing audio (FLAC, MP3, M4A, AIFF, MKA, OGG, …), video (MP4, MOV, MKV, …) or image (JPEG, TIFF, HEIC, PNG) files.")
-                )
+                Table(displayRows, selection: displaySelection) {
+                TableColumn("#") { row in
+                    Text(row.value.track)
+                        .font(.system(.body, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                }
+                .width(min: 50, ideal: 60, max: 90)
+                TableColumn("File") { row in
+                    HStack {
+                        Image(systemName: icon(for: row.value.file.ext))
+                            .foregroundStyle(.tint)
+                        Text(row.value.file.name).lineLimit(1)
+                    }
+                }
+                TableColumn("Title") { row in
+                    Text(row.value.title ?? "—")
+                        .foregroundStyle(row.value.title == nil ? .secondary : .primary)
+                        .lineLimit(1)
+                }
+            }
+            .tableColumnHeaders(.hidden)
+            .contextMenu(forSelectionType: Int.self) { positions in
+                // Right-click on a row: ensure the clicked row participates in
+                // the action even if it wasn't already selected.
+                let targets = positions.isEmpty
+                    ? appState.selectedFileIDs
+                    : Set(displayRows.compactMap { row in
+                        positions.contains(row.id) ? row.value.id : nil
+                    })
+                Button("Reveal in Finder") { revealInFinder(targets) }
+                    .disabled(targets.isEmpty)
+                Button("Reveal in Seeker") { revealInSeeker(targets) }
+                    .disabled(targets.isEmpty)
+                Divider()
+                Button("Refresh") { appState.refreshFiles() }
+            }
+            .background {
+                // Hidden ⌘C handler: copies the selected file's title (or its
+                // filename without extension if no title is known). Disabled when
+                // nothing is selected so the shortcut falls through to the system.
+                Button("Copy", action: copySelectedTitle)
+                    .keyboardShortcut("c", modifiers: .command)
+                    .disabled(appState.selectedFileIDs.isEmpty)
+                    .opacity(0)
+                    .frame(width: 0, height: 0)
+                    .accessibilityHidden(true)
+            }
+            .overlay {
+                if appState.files.isEmpty {
+                    ContentUnavailableView(
+                        "No media files",
+                        systemImage: "play.rectangle",
+                        description: Text("Select a folder containing audio (FLAC, MP3, M4A, AIFF, MKA, OGG, …), video (MP4, MOV, MKV, …) or image (JPEG, TIFF, HEIC, PNG) files.")
+                    )
+                }
             }
         }
+    }
+
+    private var tableHeader: some View {
+        HStack(spacing: 0) {
+            Text("#")
+                .padding(.leading, 8)
+                .frame(width: 60, alignment: .leading)
+            Divider()
+            sortButton("File", field: .file)
+            Divider()
+            sortButton("Title", field: .title)
+        }
+        .frame(height: 28)
+        .background(Color(nsColor: .controlBackgroundColor))
+        .font(.callout)
+    }
+
+    private func sortButton(_ title: String, field: FileListSortField) -> some View {
+        Button {
+            if sortField == field {
+                sortAscending.toggle()
+            } else {
+                sortField = field
+                sortAscending = true
+            }
+        } label: {
+            HStack(spacing: 5) {
+                Text(title)
+                if sortField == field {
+                    Image(systemName: sortAscending ? "chevron.up" : "chevron.down")
+                        .font(.caption2)
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, 8)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 
     /// Show the given file URLs in Finder. When multiple URLs share a parent

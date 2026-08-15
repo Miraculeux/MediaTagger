@@ -2,6 +2,19 @@ import Foundation
 import AVFoundation
 import AppKit
 
+private final class LockedResult<Value>: @unchecked Sendable {
+    private let lock = NSLock()
+    private var result: Result<Value, Error>?
+
+    func set(_ result: Result<Value, Error>) {
+        lock.withLock { self.result = result }
+    }
+
+    func get() -> Result<Value, Error> {
+        lock.withLock { result! }
+    }
+}
+
 /// Front-door for reading and writing media metadata.
 /// FLAC is handled natively (full read+write); other formats are read via
 /// `AVAsset` (read-only for now). Stage 2 can extend writing for MP3/M4A.
@@ -25,7 +38,7 @@ struct MetadataService {
             return try readDFF(url)
         case let ext where MediaFile.imageExtensions.contains(ext):
             return readImage(url)
-        default:     return try readAVAsset(url)
+        default:     return try readAVAssetSynchronously(url)
         }
     }
 
@@ -36,8 +49,8 @@ struct MetadataService {
     /// Read both metadata and stream-level tech info in a single pass when
     /// the format allows it. For FLAC/DSF/DFF this means **one** file scan
     /// produces both results; for AV-backed formats we run the metadata
-    /// read synchronously and the tech-info probe asynchronously so that
-    /// AVAsset's value loading never blocks a worker thread on a semaphore.
+    /// native metadata readers remain synchronous while AVAsset metadata and
+    /// tech-info properties use their modern asynchronous loading APIs.
     func readAll(_ url: URL) async throws -> (MediaMetadata, MediaTechnicalInfo) {
         let fileSize = (try? FileManager.default
             .attributesOfItem(atPath: url.path)[.size] as? Int64) ?? nil
@@ -69,9 +82,14 @@ struct MetadataService {
                         TechnicalInfoService.from(image: info, fileSize: fileSize)))
 
         default:
-            // Metadata read is sync (already streaming where applicable);
-            // tech info goes through the async AV fallback.
-            let md = try read(url)
+            let md: MediaMetadata
+            switch url.pathExtension.lowercased() {
+            case "mp3", "m4a", "m4b", "mp4", "m4v", "mov", "alac",
+                 "aiff", "aif", "aifc", "mka", "mkv", "webm", "avi":
+                md = try read(url)
+            default:
+                md = try await readAVAsset(url)
+            }
             let tech = await TechnicalInfoService.avFallback(
                 url, container: container, fileSize: fileSize)
             return (md, tech)
@@ -346,26 +364,35 @@ struct MetadataService {
 
     // MARK: - AVAsset (read-only fallback)
 
-    private func readAVAsset(_ url: URL) throws -> MediaMetadata {
+    private func readAVAssetSynchronously(_ url: URL) throws -> MediaMetadata {
+        let semaphore = DispatchSemaphore(value: 0)
+        let result = LockedResult<MediaMetadata>()
+        Task {
+            do { result.set(.success(try await readAVAsset(url))) }
+            catch { result.set(.failure(error)) }
+            semaphore.signal()
+        }
+        semaphore.wait()
+        return try result.get().get()
+    }
+
+    private func readAVAsset(_ url: URL) async throws -> MediaMetadata {
         let asset = AVURLAsset(url: url)
         var tags: [MediaMetadata.Tag] = []
         var cover: Data?
         var coverMime: String?
 
-        let semaphore = DispatchSemaphore(value: 0)
-        var loadedItems: [AVMetadataItem] = []
-        asset.loadValuesAsynchronously(forKeys: ["commonMetadata", "metadata"]) {
-            loadedItems = asset.commonMetadata + asset.metadata
-            semaphore.signal()
-        }
-        semaphore.wait()
+        async let commonMetadata = asset.load(.commonMetadata)
+        async let metadata = asset.load(.metadata)
+        let loadedItems = try await commonMetadata + metadata
 
         for item in loadedItems {
             let key = (item.commonKey?.rawValue ?? item.key as? String ?? "").uppercased()
             if key.isEmpty { continue }
-            if let str = item.stringValue {
+            if let str = try? await item.load(.stringValue) {
                 tags.append(.init(key: mapCommonKey(key), value: str))
-            } else if let data = item.dataValue, key.contains("ARTWORK") || key.contains("COVER") || key == "PIC" {
+            } else if (key.contains("ARTWORK") || key.contains("COVER") || key == "PIC"),
+                      let data = try? await item.load(.dataValue) {
                 cover = data
                 coverMime = mimeForImageData(data)
             }

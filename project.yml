@@ -63,6 +63,7 @@ targets:
           - "$(inherited)"
           - "@executable_path/../Frameworks"
     dependencies:
+      - sdk: AppIntents.framework
       # VLCKit is fetched on demand via Scripts/fetch_vlckit.sh and not
       # committed to the repo (it's ~400 MB extracted). When missing, the
       # XcodeGen `optional: true` flag silently skips the dependency and
@@ -78,6 +79,7 @@ targets:
       - path: MediaTaggerTests
     dependencies:
       - target: MediaTagger
+      - sdk: AppIntents.framework
     settings:
       base:
         BUNDLE_LOADER: "$(TEST_HOST)"

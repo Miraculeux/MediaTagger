@@ -155,11 +155,15 @@ final class AppState: ObservableObject {
             // running a handful of reads in parallel cuts wall-clock time
             // by ~Nx. Cap the pool to avoid spinning up dozens of FDs on
             // huge folders.
-            titleLoadTask = Task.detached { [weak self, files = files, scanToken] in
+            titleLoadTask = Task.detached { [appState = self, files = files, scanToken] in
                 let service = MetadataService()
                 await withTaskGroup(of: (URL, String?, String?)?.self) { group in
                     var inFlight = 0
                     let maxConcurrent = 6
+                    let publishBatchSize = 64
+                    var pendingTitles: [URL: String] = [:]
+                    var pendingTracks: [URL: String] = [:]
+                    var completedSincePublish = 0
                     var iter = files.makeIterator()
                     func addNext() {
                         guard let f = iter.next() else { return }
@@ -175,16 +179,38 @@ final class AppState: ObservableObject {
                         inFlight -= 1
                         if Task.isCancelled { group.cancelAll(); return }
                         if let (url, title, track) = result {
-                            await MainActor.run {
+                            if let title { pendingTitles[url] = title }
+                            if let track { pendingTracks[url] = track }
+                        }
+                        completedSincePublish += 1
+                        if completedSincePublish >= publishBatchSize {
+                            let titlesToPublish = pendingTitles
+                            let tracksToPublish = pendingTracks
+                            pendingTitles.removeAll(keepingCapacity: true)
+                            pendingTracks.removeAll(keepingCapacity: true)
+                            completedSincePublish = 0
+                            let accepted = await MainActor.run {
                                 guard !Task.isCancelled,
-                                      let self,
-                                      self.titleLoadGeneration == scanToken
-                                else { return }
-                                if let title { self.titles[url] = title }
-                                if let track { self.tracks[url] = track }
+                                      appState.titleLoadGeneration == scanToken
+                                else { return false }
+                                appState.titles.merge(titlesToPublish) { _, new in new }
+                                appState.tracks.merge(tracksToPublish) { _, new in new }
+                                return true
                             }
+                            if !accepted { group.cancelAll(); return }
                         }
                         addNext()
+                    }
+                    if !pendingTitles.isEmpty || !pendingTracks.isEmpty {
+                        let titlesToPublish = pendingTitles
+                        let tracksToPublish = pendingTracks
+                        await MainActor.run {
+                            guard !Task.isCancelled,
+                                  appState.titleLoadGeneration == scanToken
+                            else { return }
+                            appState.titles.merge(titlesToPublish) { _, new in new }
+                            appState.tracks.merge(tracksToPublish) { _, new in new }
+                        }
                     }
                     _ = inFlight
                 }
@@ -221,6 +247,7 @@ final class AppState: ObservableObject {
     /// of files therefore stops flickering the right pane on every step —
     /// only the file the user lands on is fully loaded.
     func setSelection(_ ids: Set<URL>) {
+        guard ids != selectedFileIDs else { return }
         selectedFileIDs = ids
         isDirty = false
         commitSelectionTask?.cancel()
@@ -266,22 +293,22 @@ final class AppState: ObservableObject {
         // Show cached tech info immediately if we've seen this file in
         // this session; otherwise clear stale tech from the previous file.
         technicalInfo = techInfoCache[url]
-        metadataLoadTask = Task.detached(priority: .userInitiated) { [weak self] in
+        metadataLoadTask = Task.detached(priority: .userInitiated) { [appState = self] in
             if Task.isCancelled { return }
             let result: Result<(MediaMetadata, MediaTechnicalInfo), Error>
             do { result = .success(try await service.readAll(url)) }
             catch { result = .failure(error) }
             if Task.isCancelled { return }
             await MainActor.run {
-                guard let self, self.loadGeneration == token else { return }
+                guard appState.loadGeneration == token else { return }
                 switch result {
                 case .success(let (md, tech)):
-                    self.metadata = md
-                    self.technicalInfo = tech
-                    self.techInfoCache[url] = tech
+                    appState.metadata = md
+                    appState.technicalInfo = tech
+                    appState.techInfoCache[url] = tech
                 case .failure(let err):
-                    self.lastError = err.localizedDescription
-                    self.metadata = MediaMetadata()
+                    appState.lastError = err.localizedDescription
+                    appState.metadata = MediaMetadata()
                 }
             }
         }
@@ -373,7 +400,7 @@ final class AppState: ObservableObject {
             ? 2
             : max(2, min(ProcessInfo.processInfo.activeProcessorCount, 6))
 
-        batchTask = Task.detached { [weak self] in
+        batchTask = Task.detached { [appState = self] in
             struct ItemResult {
                 let oldURL: URL
                 let url: URL
@@ -552,30 +579,30 @@ final class AppState: ObservableObject {
                     await MainActor.run {
                         if !didFail {
                             if snapshot.oldURL != snapshot.url {
-                                if let i = self?.files.firstIndex(where: { $0.id == snapshot.oldURL }) {
-                                    self?.files[i] = MediaFile(id: snapshot.url)
+                                if let i = appState.files.firstIndex(where: { $0.id == snapshot.oldURL }) {
+                                    appState.files[i] = MediaFile(id: snapshot.url)
                                 }
-                                if self?.selectedFileIDs.contains(snapshot.oldURL) == true {
-                                    self?.selectedFileIDs.remove(snapshot.oldURL)
-                                    self?.selectedFileIDs.insert(snapshot.url)
+                                if appState.selectedFileIDs.contains(snapshot.oldURL) {
+                                    appState.selectedFileIDs.remove(snapshot.oldURL)
+                                    appState.selectedFileIDs.insert(snapshot.url)
                                 }
-                                if self?.selectedFile?.id == snapshot.oldURL {
-                                    self?.selectedFile = MediaFile(id: snapshot.url)
+                                if appState.selectedFile?.id == snapshot.oldURL {
+                                    appState.selectedFile = MediaFile(id: snapshot.url)
                                 }
-                                if let oldTitle = self?.titles.removeValue(forKey: snapshot.oldURL) {
-                                    self?.titles[snapshot.url] = oldTitle
+                                if let oldTitle = appState.titles.removeValue(forKey: snapshot.oldURL) {
+                                    appState.titles[snapshot.url] = oldTitle
                                 }
-                                if let oldTrack = self?.tracks.removeValue(forKey: snapshot.oldURL) {
-                                    self?.tracks[snapshot.url] = oldTrack
+                                if let oldTrack = appState.tracks.removeValue(forKey: snapshot.oldURL) {
+                                    appState.tracks[snapshot.url] = oldTrack
                                 }
-                                self?.techInfoCache.removeValue(forKey: snapshot.oldURL)
+                                appState.techInfoCache.removeValue(forKey: snapshot.oldURL)
                             }
-                            self?.titles[snapshot.url] = snapshot.title
-                            self?.tracks[snapshot.url] = snapshot.track
+                            appState.titles[snapshot.url] = snapshot.title
+                            appState.tracks[snapshot.url] = snapshot.track
                             // File contents changed — drop cached tech info.
-                            self?.techInfoCache.removeValue(forKey: snapshot.url)
+                            appState.techInfoCache.removeValue(forKey: snapshot.url)
                         }
-                        self?.batchProgress = progress
+                        appState.batchProgress = progress
                     }
 
                     if nextIndex < total, !Task.isCancelled {
@@ -586,14 +613,16 @@ final class AppState: ObservableObject {
             }
 
             let wasCancelled = Task.isCancelled
+            let completedSnapshot = completed
+            let firstErrorSnapshot = firstError
             await MainActor.run {
-                self?.batchInProgress = false
-                self?.batchDescription = ""
-                self?.batchTask = nil
+                appState.batchInProgress = false
+                appState.batchDescription = ""
+                appState.batchTask = nil
                 if wasCancelled {
-                    self?.lastError = "Batch cancelled (\(completed)/\(total) files processed)"
-                } else if let firstError {
-                    self?.lastError = firstError
+                    appState.lastError = "Batch cancelled (\(completedSnapshot)/\(total) files processed)"
+                } else if let firstErrorSnapshot {
+                    appState.lastError = firstErrorSnapshot
                 }
             }
         }
@@ -646,29 +675,29 @@ final class AppState: ObservableObject {
         let maxConcurrent = isExternal ? 2 : 4
         let rootURL = root
 
-        batchTask = Task.detached { [weak self] in
+        batchTask = Task.detached { [appState = self] in
             // 1. Collect every subdirectory (including the root itself).
             let dirs = await Self.collectAudioDirs(under: rootURL)
             let totalDirs = dirs.count
             guard totalDirs > 0 else {
                 await MainActor.run {
-                    self?.batchInProgress = false
-                    self?.batchDescription = ""
-                    self?.batchTask = nil
-                    self?.lastError = "No music files found under \(rootURL.lastPathComponent)"
+                    appState.batchInProgress = false
+                    appState.batchDescription = ""
+                    appState.batchTask = nil
+                    appState.lastError = "No music files found under \(rootURL.lastPathComponent)"
                 }
                 return
             }
             if Task.isCancelled {
                 await MainActor.run {
-                    self?.batchInProgress = false
-                    self?.batchDescription = ""
-                    self?.batchTask = nil
+                    appState.batchInProgress = false
+                    appState.batchDescription = ""
+                    appState.batchTask = nil
                 }
                 return
             }
             await MainActor.run {
-                self?.batchDescription = "Repairing covers in \(totalDirs) folder\(totalDirs == 1 ? "" : "s")…"
+                appState.batchDescription = "Repairing covers in \(totalDirs) folder\(totalDirs == 1 ? "" : "s")…"
             }
 
             var completed = 0
@@ -700,30 +729,31 @@ final class AppState: ObservableObject {
                         }
                     }
                     let progress = Double(completed) / Double(totalDirs)
-                    await MainActor.run { self?.batchProgress = progress }
+                    await MainActor.run { appState.batchProgress = progress }
                     enqueueNext()
                 }
             }
 
             let wasCancelled = Task.isCancelled
+            let firstErrorSnapshot = firstError
+            let statsSnapshot = stats
             await MainActor.run {
-                guard let self else { return }
-                self.batchInProgress = false
-                self.batchProgress = 0
-                self.batchDescription = ""
-                self.batchTask = nil
-                if let firstError {
-                    self.lastError = firstError
+                appState.batchInProgress = false
+                appState.batchProgress = 0
+                appState.batchDescription = ""
+                appState.batchTask = nil
+                if let firstErrorSnapshot {
+                    appState.lastError = firstErrorSnapshot
                 }
                 // Refresh the currently-shown folder so embedded covers
                 // appear in the editor without manual reload.
-                self.refreshFiles()
+                appState.refreshFiles()
                 let summary = "Auto-repair covers" +
                               (wasCancelled ? " (cancelled)" : "") +
-                              ": \(stats.repaired) repaired, " +
-                              "\(stats.alreadyCovered) already covered, " +
-                              "\(stats.noCandidate) without candidate" +
-                              (stats.errors > 0 ? ", \(stats.errors) errors" : "")
+                              ": \(statsSnapshot.repaired) repaired, " +
+                              "\(statsSnapshot.alreadyCovered) already covered, " +
+                              "\(statsSnapshot.noCandidate) without candidate" +
+                              (statsSnapshot.errors > 0 ? ", \(statsSnapshot.errors) errors" : "")
                 NSLog("MediaTagger: %@", summary)
                 let alert = NSAlert()
                 alert.messageText = wasCancelled
@@ -765,28 +795,28 @@ final class AppState: ObservableObject {
         let isExternal = isURLOnExternalVolume(root)
         let maxConcurrent = isExternal ? 2 : 4
 
-        batchTask = Task.detached { [weak self] in
+        batchTask = Task.detached { [appState = self] in
             let dirs = await Self.collectAudioDirs(under: rootURL)
             let total = dirs.count
             guard total > 0 else {
                 await MainActor.run {
-                    self?.batchInProgress = false
-                    self?.batchDescription = ""
-                    self?.batchTask = nil
-                    self?.lastError = "No music files found under \(rootURL.lastPathComponent)"
+                    appState.batchInProgress = false
+                    appState.batchDescription = ""
+                    appState.batchTask = nil
+                    appState.lastError = "No music files found under \(rootURL.lastPathComponent)"
                 }
                 return
             }
             if Task.isCancelled {
                 await MainActor.run {
-                    self?.batchInProgress = false
-                    self?.batchDescription = ""
-                    self?.batchTask = nil
+                    appState.batchInProgress = false
+                    appState.batchDescription = ""
+                    appState.batchTask = nil
                 }
                 return
             }
             await MainActor.run {
-                self?.batchDescription = "Checking \(total) folder\(total == 1 ? "" : "s") for missing cover…"
+                appState.batchDescription = "Checking \(total) folder\(total == 1 ? "" : "s") for missing cover…"
             }
 
             // Probe each dir concurrently (read-only, no writes).
@@ -806,7 +836,7 @@ final class AppState: ObservableObject {
                     completed += 1
                     if missing { hits.append(dir) }
                     let p = Double(completed) / Double(total)
-                    await MainActor.run { self?.batchProgress = p }
+                    await MainActor.run { appState.batchProgress = p }
                     enqueueNext()
                 }
             }
@@ -817,16 +847,16 @@ final class AppState: ObservableObject {
             let sorted = hits.sorted {
                 $0.path.localizedStandardCompare($1.path) == .orderedAscending
             }
+            let completedSnapshot = completed
             await MainActor.run {
-                guard let self else { return }
-                self.batchInProgress = false
-                self.batchProgress = 0
-                self.batchDescription = ""
-                self.batchTask = nil
-                self.coverlessFolders = sorted
-                self.coverlessScanRoot = rootURL
+                appState.batchInProgress = false
+                appState.batchProgress = 0
+                appState.batchDescription = ""
+                appState.batchTask = nil
+                appState.coverlessFolders = sorted
+                appState.coverlessScanRoot = rootURL
                 if wasCancelled {
-                    self.lastError = "Scan cancelled (\(completed)/\(total) folders)"
+                    appState.lastError = "Scan cancelled (\(completedSnapshot)/\(total) folders)"
                 }
             }
         }
@@ -884,29 +914,29 @@ final class AppState: ObservableObject {
         let isExternal = isURLOnExternalVolume(root)
         let maxConcurrent = isExternal ? 4 : 8
 
-        batchTask = Task.detached { [weak self] in
+        batchTask = Task.detached { [appState = self] in
             // 1. Collect all audio files under root (BFS, hidden-file safe).
             let allFiles = await Self.collectAudioFiles(under: rootURL)
             let total = allFiles.count
             guard total > 0 else {
                 await MainActor.run {
-                    self?.batchInProgress = false
-                    self?.batchDescription = ""
-                    self?.batchTask = nil
-                    self?.lastError = "No music files found under \(rootURL.lastPathComponent)"
+                    appState.batchInProgress = false
+                    appState.batchDescription = ""
+                    appState.batchTask = nil
+                    appState.lastError = "No music files found under \(rootURL.lastPathComponent)"
                 }
                 return
             }
             if Task.isCancelled {
                 await MainActor.run {
-                    self?.batchInProgress = false
-                    self?.batchDescription = ""
-                    self?.batchTask = nil
+                    appState.batchInProgress = false
+                    appState.batchDescription = ""
+                    appState.batchTask = nil
                 }
                 return
             }
             await MainActor.run {
-                self?.batchDescription = "Searching \(total) files…"
+                appState.batchDescription = "Searching \(total) files…"
             }
 
             var completed = 0
@@ -935,7 +965,7 @@ final class AppState: ObservableObject {
                     if let hit { hits.append(hit) }
                     let p = Double(completed) / Double(total)
                     if completed & 0xF == 0 {        // throttle main-thread updates
-                        await MainActor.run { self?.batchProgress = p }
+                        await MainActor.run { appState.batchProgress = p }
                     }
                     enqueueNext()
                 }
@@ -949,17 +979,17 @@ final class AppState: ObservableObject {
                 let t = ($0.title ?? "").localizedStandardCompare($1.title ?? "")
                 return t == .orderedAscending
             }
+            let completedSnapshot = completed
             await MainActor.run {
-                guard let self else { return }
-                self.batchInProgress = false
-                self.batchProgress = 0
-                self.batchDescription = ""
-                self.batchTask = nil
-                self.advancedSearchHits = sorted
-                self.advancedSearchScanRoot = rootURL
-                self.advancedSearchSummary = summary
+                appState.batchInProgress = false
+                appState.batchProgress = 0
+                appState.batchDescription = ""
+                appState.batchTask = nil
+                appState.advancedSearchHits = sorted
+                appState.advancedSearchScanRoot = rootURL
+                appState.advancedSearchSummary = summary
                 if wasCancelled {
-                    self.lastError = "Search cancelled (\(completed)/\(total) files scanned)"
+                    appState.lastError = "Search cancelled (\(completedSnapshot)/\(total) files scanned)"
                 }
             }
         }
@@ -1071,28 +1101,28 @@ final class AppState: ObservableObject {
         let maxConcurrent = isExternal ? 2 : 4
         let rootURL = root
 
-        batchTask = Task.detached { [weak self] in
+        batchTask = Task.detached { [appState = self] in
             let dirs = await Self.collectAudioDirs(under: rootURL)
             let totalDirs = dirs.count
             guard totalDirs > 0 else {
                 await MainActor.run {
-                    self?.batchInProgress = false
-                    self?.batchDescription = ""
-                    self?.batchTask = nil
-                    self?.lastError = "No music files found under \(rootURL.lastPathComponent)"
+                    appState.batchInProgress = false
+                    appState.batchDescription = ""
+                    appState.batchTask = nil
+                    appState.lastError = "No music files found under \(rootURL.lastPathComponent)"
                 }
                 return
             }
             if Task.isCancelled {
                 await MainActor.run {
-                    self?.batchInProgress = false
-                    self?.batchDescription = ""
-                    self?.batchTask = nil
+                    appState.batchInProgress = false
+                    appState.batchDescription = ""
+                    appState.batchTask = nil
                 }
                 return
             }
             await MainActor.run {
-                self?.batchDescription = "Normalizing covers in \(totalDirs) folder\(totalDirs == 1 ? "" : "s")…"
+                appState.batchDescription = "Normalizing covers in \(totalDirs) folder\(totalDirs == 1 ? "" : "s")…"
             }
 
             var completed = 0
@@ -1126,28 +1156,29 @@ final class AppState: ObservableObject {
                         }
                     }
                     let progress = Double(completed) / Double(totalDirs)
-                    await MainActor.run { self?.batchProgress = progress }
+                    await MainActor.run { appState.batchProgress = progress }
                     enqueueNext()
                 }
             }
 
             let wasCancelled = Task.isCancelled
+            let firstErrorSnapshot = firstError
+            let statsSnapshot = stats
             await MainActor.run {
-                guard let self else { return }
-                self.batchInProgress = false
-                self.batchProgress = 0
-                self.batchDescription = ""
-                self.batchTask = nil
-                if let firstError {
-                    self.lastError = firstError
+                appState.batchInProgress = false
+                appState.batchProgress = 0
+                appState.batchDescription = ""
+                appState.batchTask = nil
+                if let firstErrorSnapshot {
+                    appState.lastError = firstErrorSnapshot
                 }
-                self.refreshFiles()
+                appState.refreshFiles()
                 let summary = "Normalize covers" +
                               (wasCancelled ? " (cancelled)" : "") +
-                              ": \(stats.normalized) normalized, " +
-                              "\(stats.alreadyConforming) already conforming, " +
-                              "\(stats.noCover) without embedded cover" +
-                              (stats.errors > 0 ? ", \(stats.errors) errors" : "")
+                              ": \(statsSnapshot.normalized) normalized, " +
+                              "\(statsSnapshot.alreadyConforming) already conforming, " +
+                              "\(statsSnapshot.noCover) without embedded cover" +
+                              (statsSnapshot.errors > 0 ? ", \(statsSnapshot.errors) errors" : "")
                 NSLog("MediaTagger: %@", summary)
                 let alert = NSAlert()
                 alert.messageText = wasCancelled
