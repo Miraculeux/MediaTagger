@@ -452,7 +452,7 @@ private struct TechnicalInfoSection: View {
             bitDepth:   bitDepthString(info),
             channels:   channelsString(info),
             bitrate:    bitrateString(info),
-            duration:   durationString(info),
+            duration:   info.formattedDuration,
             fileSize:   fileSizeString(info),
             dimensions: dimensionsString(info),
             colorModel: info.isImage ? info.colorModel : nil,
@@ -515,16 +515,6 @@ private struct TechnicalInfoSection: View {
             return String(format: "%.2f Mbps", br / 1_000_000)
         }
         return String(format: "%.0f kbps", br / 1000)
-    }
-
-    private static func durationString(_ info: MediaTechnicalInfo) -> String? {
-        guard let d = info.durationSeconds, d.isFinite, d > 0 else { return nil }
-        let total = Int(d.rounded())
-        let h = total / 3600
-        let m = (total % 3600) / 60
-        let s = total % 60
-        if h > 0 { return String(format: "%d:%02d:%02d", h, m, s) }
-        return String(format: "%d:%02d", m, s)
     }
 
     private static func fileSizeString(_ info: MediaTechnicalInfo) -> String? {

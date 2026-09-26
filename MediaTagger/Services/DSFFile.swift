@@ -66,18 +66,19 @@ struct DSFFile {
         if header.count >= 80,
            header[28] == 0x66, header[29] == 0x6D,
            header[30] == 0x74, header[31] == 0x20 {              // "fmt "
-            let channelNum  = leU32(header, 48)
-            let sampleFreq  = leU32(header, 52)
-            let bitsPer     = leU32(header, 56)
-            let sampleCount = leU64(header, 60)
+            // The fmt payload starts at 40; channel type precedes channel count.
+            let channelNum  = leU32(header, 52)
+            let sampleFreq  = leU32(header, 56)
+            let sampleCount = leU64(header, 64)
             tech.channels = Int(channelNum)
             tech.sampleRate = Double(sampleFreq)
-            tech.bitsPerSample = Int(bitsPer)
+            // DSF's bits-per-sample field encodes bit order (1 = LSB, 8 = MSB).
+            tech.bitsPerSample = 1
             if sampleFreq > 0 {
                 tech.durationSeconds = Double(sampleCount) / Double(sampleFreq)
             }
             if sampleFreq > 0 && channelNum > 0 {
-                tech.bitrate = Double(sampleFreq) * Double(channelNum) * Double(bitsPer)
+                tech.bitrate = Double(sampleFreq) * Double(channelNum)
             }
         }
 

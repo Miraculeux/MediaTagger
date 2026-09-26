@@ -29,4 +29,18 @@ struct MediaTechnicalInfo: Equatable {
     var pixelHeight: Int?
     /// Image color model (e.g. "RGB", "Gray", "CMYK").
     var colorModel: String?
+
+    var formattedDuration: String? {
+        guard let duration = durationSeconds, duration.isFinite, duration > 0,
+              let total = Int(exactly: duration.rounded()) else { return nil }
+        let hours = total / 3600
+        let minutes = (total % 3600) / 60
+        let seconds = total % 60
+        let secondsText = seconds < 10 ? "0\(seconds)" : "\(seconds)"
+        if hours > 0 {
+            let minutesText = minutes < 10 ? "0\(minutes)" : "\(minutes)"
+            return "\(hours):\(minutesText):\(secondsText)"
+        }
+        return "\(minutes):\(secondsText)"
+    }
 }

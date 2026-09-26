@@ -75,6 +75,66 @@ final class DSFFileTests: XCTestCase {
 
     // MARK: - tests
 
+    func testTechnicalInfoUsesDSFFieldOffsets() throws {
+        var raw = makeMinimalDSF()
+        raw.replaceSubrange(48..<52, with: leU32(4)) // channel type differs from channel count
+        raw.replaceSubrange(52..<56, with: leU32(3))
+        raw.replaceSubrange(56..<60, with: leU32(5_644_800))
+        raw.replaceSubrange(64..<72, with: leU64(5_644_800 * 90))
+        try raw.write(to: fileURL)
+
+        for summaryOnly in [false, true] {
+            let info = try DSFFile.read(fileURL, summaryOnly: summaryOnly).techInfo
+            XCTAssertEqual(info.channels, 3)
+            XCTAssertEqual(info.sampleRate, 5_644_800)
+            XCTAssertEqual(info.bitsPerSample, 1)
+            XCTAssertEqual(info.durationSeconds, 90)
+            XCTAssertEqual(info.bitrate, 16_934_400)
+        }
+    }
+
+    func testDSD256ReferenceHeaderDurationThroughMetadataService() async throws {
+        // Fixed fmt bytes from the reported file; no audio or embedded artwork is needed.
+        let fmt = Data([
+            0x66, 0x6D, 0x74, 0x20, 0x34, 0, 0, 0, 0, 0, 0, 0,
+            1, 0, 0, 0, 0, 0, 0, 0,
+            2, 0, 0, 0, 2, 0, 0, 0,
+            0, 0x44, 0xAC, 0, 1, 0, 0, 0,
+            0, 0x46, 0xCB, 0x8E, 1, 0, 0, 0,
+            0, 0x10, 0, 0, 0, 0, 0, 0
+        ])
+        var raw = makeMinimalDSF()
+        raw.replaceSubrange(28..<80, with: fmt)
+        try raw.write(to: fileURL)
+
+        let (_, info) = try await MetadataService().readAll(fileURL)
+        XCTAssertEqual(info.sampleRate, 11_289_600)
+        XCTAssertEqual(info.channels, 2)
+        XCTAssertEqual(info.bitsPerSample, 1)
+        XCTAssertEqual(info.bitrate, 22_579_200)
+        XCTAssertEqual(try XCTUnwrap(info.durationSeconds), 592.638684807256, accuracy: 0.000001)
+        XCTAssertEqual(info.formattedDuration, "9:53")
+    }
+
+    func testMSBBitOrderStillRepresentsOneBitDSD() throws {
+        var raw = makeMinimalDSF()
+        raw.replaceSubrange(60..<64, with: leU32(8))
+        try raw.write(to: fileURL)
+        let info = try DSFFile.read(fileURL).techInfo
+        XCTAssertEqual(info.bitsPerSample, 1)
+        XCTAssertEqual(info.bitrate, 5_644_800)
+        XCTAssertEqual(try XCTUnwrap(info.durationSeconds), 512.0 / 2_822_400, accuracy: 0.000000001)
+    }
+
+    func testZeroSampleRateDoesNotProduceInvalidDuration() throws {
+        var raw = makeMinimalDSF()
+        raw.replaceSubrange(56..<60, with: leU32(0))
+        try raw.write(to: fileURL)
+        let info = try DSFFile.read(fileURL).techInfo
+        XCTAssertNil(info.durationSeconds)
+        XCTAssertNil(info.bitrate)
+    }
+
     func testWriteCreatesID3AndPreservesAudio() throws {
         try DSFFile.write(url: fileURL, entries: [
             ("TITLE", "Hello DSF"),

@@ -136,7 +136,8 @@ xcodebuild -project MediaTagger.xcodeproj -scheme MediaTagger \
 
 The [MediaTaggerTests](MediaTaggerTests) target covers each format parser plus
 round-trip read/write tests for FLAC and ID3v2, and the batch-operation
-pipeline.
+pipeline. DSF technical-info tests cover field offsets, 64-bit sample counts,
+DSD bit order, and duration formatting.
 
 ## Sandbox
 
