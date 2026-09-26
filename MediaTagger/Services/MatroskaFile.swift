@@ -48,7 +48,8 @@ struct MatroskaFile {
     ///   2. For each interesting element (Tags, Attachments) the SeekHead
     ///      points to, just enough bytes to cover the element body.
     /// Total bytes read for a typical 5 GB MKV: a few hundred KB.
-    static func read(_ url: URL) throws -> MatroskaFile {
+    /// Summary reads preserve tags but seek past attachments, even in the head.
+    static func read(_ url: URL, summaryOnly: Bool = false) throws -> MatroskaFile {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
 
@@ -58,7 +59,9 @@ struct MatroskaFile {
         // 1. Read the head: enough for EBML header + Segment header + SeekHead.
         //    SeekHead is normally <2 KB; 64 KB gives plenty of headroom.
         let headLen = min(UInt64(64 * 1024), fileSize)
-        let head = handle.readData(ofLength: Int(headLen))
+        let head = summaryOnly
+            ? try readSummaryHead(handle: handle, length: Int(headLen))
+            : handle.readData(ofLength: Int(headLen))
         guard head.count >= 4,
               head[0] == 0x1A, head[1] == 0x45, head[2] == 0xDF, head[3] == 0xA3
         else { throw MatroskaError.notMatroska }
@@ -105,7 +108,7 @@ struct MatroskaFile {
                         entries.append(contentsOf: decodeTags(body, start: 0, end: body.count))
                     }
                 }
-                if let off = seekTargets[EBML.IDs.attachments] {
+                if !summaryOnly, let off = seekTargets[EBML.IDs.attachments] {
                     if let body = try readElementBody(
                         handle: handle, fileSize: fileSize,
                         absOffset: segmentBodyAbs + off,
@@ -123,8 +126,11 @@ struct MatroskaFile {
         //    appear before the first Cluster when no SeekHead is present.
         var abs = segmentBodyAbs
         while abs < segmentBodyEndAbs {
+            if summaryOnly { try Task.checkCancellation() }
             try handle.seek(toOffset: abs)
-            let hdr = handle.readData(ofLength: 16)
+            let hdr = summaryOnly
+                ? readElementHeader(handle: handle)
+                : handle.readData(ofLength: 16)
             guard let (id, idLen) = EBML.readID(hdr, at: 0),
                   let (size, sizeLen, _) = EBML.readSize(hdr, at: idLen)
             else { break }
@@ -135,7 +141,7 @@ struct MatroskaFile {
                 try handle.seek(toOffset: bodyAbs)
                 let body = handle.readData(ofLength: Int(bodyEndAbs - bodyAbs))
                 entries.append(contentsOf: decodeTags(body, start: 0, end: body.count))
-            case EBML.IDs.attachments:
+            case EBML.IDs.attachments where !summaryOnly:
                 try handle.seek(toOffset: bodyAbs)
                 let body = handle.readData(ofLength: Int(bodyEndAbs - bodyAbs))
                 if cover == nil {
@@ -149,6 +155,64 @@ struct MatroskaFile {
             abs = bodyEndAbs
         }
         return MatroskaFile(url: url, entries: entries, cover: cover)
+    }
+
+    /// Keep the existing bounded head/SeekHead parsers, but fill only headers
+    /// and SeekHead bytes. A normal 64 KB peek can otherwise read artwork when
+    /// Attachments is the first Segment child.
+    private static func readSummaryHead(handle: FileHandle, length: Int) throws -> Data {
+        var head = Data(count: length)
+        var p = 0
+        var segmentEnd = length
+        var inSegment = false
+        var children = 0
+        while p < segmentEnd {
+            try Task.checkCancellation()
+            try handle.seek(toOffset: UInt64(p))
+            let header = readElementHeader(handle: handle)
+            let count = min(header.count, length - p)
+            head.replaceSubrange(p..<p + count, with: header.prefix(count))
+            guard let (id, idLen) = EBML.readID(header, at: 0),
+                  let (size, sizeLen, unknown) = EBML.readSize(header, at: idLen)
+            else { break }
+            let body = p + idLen + sizeLen
+            guard body <= segmentEnd else { break }
+            let end = body + Int(min(size, UInt64(segmentEnd - body)))
+            if !inSegment && id == EBML.IDs.segment {
+                inSegment = true
+                segmentEnd = unknown ? length : end
+                p = body
+                continue
+            }
+            if inSegment {
+                children += 1
+                if id == EBML.IDs.seekHead {
+                    let payload = handle.readData(ofLength: end - body)
+                    head.replaceSubrange(body..<body + payload.count, with: payload)
+                    break
+                }
+                if children == 4 { break }
+            } else if unknown {
+                break
+            }
+            p = end
+        }
+        return head
+    }
+
+    /// Read exactly an EBML header, never bytes from the following payload.
+    private static func readElementHeader(handle: FileHandle) -> Data {
+        var header = handle.readData(ofLength: 1)
+        guard let first = header.first, first != 0 else { return header }
+        let idLength = first.leadingZeroBitCount + 1
+        guard idLength <= 4 else { return header }
+        header.append(handle.readData(ofLength: idLength - 1))
+        guard header.count == idLength else { return header }
+        let sizeFirst = handle.readData(ofLength: 1)
+        header.append(sizeFirst)
+        guard let first = sizeFirst.first, first != 0 else { return header }
+        header.append(handle.readData(ofLength: first.leadingZeroBitCount))
+        return header
     }
 
     /// Read element header at absolute offset `absOffset`, verify its ID,
@@ -340,74 +404,76 @@ struct MatroskaFile {
     static func write(url: URL,
                       entries: [(key: String, value: String)],
                       cover: (data: Data, mime: String)?) throws {
-        let original = try Data(contentsOf: url, options: .mappedIfSafe)
-        guard original.count >= 4,
-              original[0] == 0x1A, original[1] == 0x45,
-              original[2] == 0xDF, original[3] == 0xA3
+        let source = try FileHandle(forReadingFrom: url)
+        defer { try? source.close() }
+        let fileSize = try source.seekToEnd()
+        try source.seek(toOffset: 0)
+        let signature = try source.read(upToCount: 4) ?? Data()
+        guard signature == Data([0x1A, 0x45, 0xDF, 0xA3])
         else { throw MatroskaError.notMatroska }
 
+        // EBML IDs and size VINTs occupy at most twelve bytes together.
+        func readHeader(at offset: UInt64, end: UInt64) throws -> Data {
+            try source.seek(toOffset: offset)
+            return try source.read(upToCount: Int(min(12, end - offset))) ?? Data()
+        }
+
         // Locate EBML header and Segment.
-        var p = 0
-        var ebmlHeaderEnd = 0
-        var segmentIDStart = -1
-        var segmentBodyStart = -1
-        var segmentBodyEnd = original.count
-        while p < original.count {
-            guard let (id, idLen) = EBML.readID(original, at: p),
-                  let (size, sizeLen, isUnknown) = EBML.readSize(original, at: p + idLen)
+        var p: UInt64 = 0
+        var ebmlHeaderEnd: UInt64 = 0
+        var segmentBodyStart: UInt64?
+        var segmentBodyEnd = fileSize
+        while p < fileSize {
+            let header = try readHeader(at: p, end: fileSize)
+            guard let (id, idLen) = EBML.readID(header, at: 0),
+                  let (size, sizeLen, isUnknown) = EBML.readSize(header, at: idLen)
             else { break }
-            let bodyStart = p + idLen + sizeLen
-            let bodyEnd = isUnknown ? original.count : min(bodyStart + Int(size), original.count)
+            let bodyStart = p + UInt64(idLen + sizeLen)
+            let bodyEnd = isUnknown ? fileSize : bodyStart + min(size, fileSize - bodyStart)
             if id == EBML.IDs.ebmlHeader {
                 ebmlHeaderEnd = bodyEnd
             } else if id == EBML.IDs.segment {
-                segmentIDStart = p
                 segmentBodyStart = bodyStart
                 segmentBodyEnd = bodyEnd
                 break
             }
             p = bodyEnd
         }
-        guard segmentIDStart >= 0 else { throw MatroskaError.notMatroska }
+        guard let segmentBodyStart else { throw MatroskaError.notMatroska }
 
-        // Collect Segment children, dropping SeekHead/Tags/Attachments. We keep
-        // the raw bytes of every other child to preserve them verbatim.
-        var keptChildrenBytes = Data()
-        var q = segmentBodyStart
-        while q < segmentBodyEnd {
-            guard let (cid, cidLen) = EBML.readID(original, at: q),
-                  let (csize, csizeLen, _) = EBML.readSize(original, at: q + cidLen)
-            else { break }
-            let bodyStart = q + cidLen + csizeLen
-            let bodyEnd = min(bodyStart + Int(csize), segmentBodyEnd)
-            switch cid {
-            case EBML.IDs.seekHead, EBML.IDs.tags, EBML.IDs.attachments:
-                break // drop
-            default:
-                keptChildrenBytes.append(original.subdata(in: q..<bodyEnd))
+        try IOStreaming.writeAtomically(to: url) { tmp in
+            let destination = try FileHandle(forWritingTo: tmp)
+            defer { try? destination.close() }
+            try source.seek(toOffset: 0)
+            try IOStreaming.stream(from: source, into: destination, byteCount: ebmlHeaderEnd)
+            try destination.write(contentsOf: EBML.IDs.segmentBytes)
+            try destination.write(contentsOf: Data([0xFF]))
+
+            // Keep the existing policy: drop SeekHead/Tags/Attachments and
+            // stream every other Segment child verbatim, in original order.
+            var q = segmentBodyStart
+            while q < segmentBodyEnd {
+                let header = try readHeader(at: q, end: segmentBodyEnd)
+                guard let (cid, cidLen) = EBML.readID(header, at: 0),
+                      let (csize, csizeLen, _) = EBML.readSize(header, at: cidLen)
+                else { break }
+                let bodyStart = q + UInt64(cidLen + csizeLen)
+                let bodyEnd = bodyStart + min(csize, segmentBodyEnd - bodyStart)
+                switch cid {
+                case EBML.IDs.seekHead, EBML.IDs.tags, EBML.IDs.attachments:
+                    break
+                default:
+                    try source.seek(toOffset: q)
+                    try IOStreaming.stream(from: source, into: destination,
+                                           byteCount: bodyEnd - q)
+                }
+                q = bodyEnd
             }
-            q = bodyEnd
+            try destination.write(contentsOf: buildTagsElement(entries: entries))
+            if let cover {
+                try destination.write(contentsOf: buildAttachmentsElement(cover: cover))
+            }
         }
-
-        // Build new Tags + Attachments and assemble a Segment with unknown
-        // length (one VINT byte = 0xFF) so we never need to compute its size.
-        var newSegmentBody = Data()
-        newSegmentBody.append(keptChildrenBytes)
-        newSegmentBody.append(buildTagsElement(entries: entries))
-        if let cover {
-            newSegmentBody.append(buildAttachmentsElement(cover: cover))
-        }
-
-        var out = Data()
-        out.append(original.subdata(in: 0..<ebmlHeaderEnd))   // EBML header verbatim
-        out.append(EBML.IDs.segmentBytes)                     // Segment ID
-        out.append(0xFF)                                       // unknown-size VINT
-        out.append(newSegmentBody)
-
-        let tmp = url.deletingLastPathComponent()
-            .appendingPathComponent(".\(url.lastPathComponent).tmp-\(UUID().uuidString)")
-        try out.write(to: tmp, options: .atomic)
-        _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
     }
 
     // MARK: - Element builders

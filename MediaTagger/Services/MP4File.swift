@@ -38,7 +38,8 @@ struct MP4File {
     }
 
     /// Decode metadata entries + cover from `moov/udta/meta/ilst`.
-    func decoded() -> (entries: [Entry], cover: Cover?) {
+    /// Summary decoding reads title/track atoms only, never the cover payload.
+    func decoded(summaryOnly: Bool = false) -> (entries: [Entry], cover: Cover?) {
         guard
             let moov = topAtoms.first(where: { $0.type == "moov" }),
             let udta = moov.childContainer(type: "udta"),
@@ -50,9 +51,26 @@ struct MP4File {
         var cover: Cover?
 
         for tag in ilst.children {
+            if summaryOnly && Task.isCancelled { return ([], nil) }
+            if summaryOnly && tag.type != "©nam" && tag.type != "trkn" && tag.type != "----" {
+                continue
+            }
             // Each tag atom contains one or more `data` (or `mean`/`name`/`data`
             // for freeform `----`) children.
             if tag.type == "----" {
+                if summaryOnly {
+                    var name: String?
+                    for child in tag.children where child.type == "name" {
+                        if Task.isCancelled { return ([], nil) }
+                        let payload = child.readPayload(from: url)
+                        if payload.count >= 4 {
+                            name = String(data: payload.dropFirst(4), encoding: .utf8)
+                        }
+                    }
+                    guard let name,
+                          ["TITLE", "TRACKNUMBER", "TRACKTOTAL"].contains(name.uppercased())
+                    else { continue }
+                }
                 // Freeform: mean / name / data
                 var name: String?
                 var dataBytes: Data?
@@ -135,18 +153,20 @@ struct MP4File {
 
     fileprivate func writeReplacingMetadata(entries: [(key: String, value: String)],
                                             cover: Cover?) throws {
-        // Memory-map the input so very large containers (multi-GB MP4 video)
-        // don't cause a full-file copy into the resident set just to read the
-        // moov bytes. The kernel pages content in on demand; subdata() and
-        // the rebuild path then allocate only what they need.
-        let original = try Data(contentsOf: url, options: .mappedIfSafe)
-
         guard let moovIdx = topAtoms.firstIndex(where: { $0.type == "moov" }) else {
             throw NSError(domain: "MediaTagger.MP4", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: "No moov atom"])
         }
         let moov = topAtoms[moovIdx]
-        let oldMoovBytes = original.subdata(in: Int(moov.start)..<Int(moov.end))
+        let source = try FileHandle(forReadingFrom: url)
+        defer { try? source.close() }
+        // Only the editable moov tree is buffered; media atoms are streamed.
+        try source.seek(toOffset: moov.start)
+        let oldMoovBytes = try source.read(upToCount: Int(moov.end - moov.start)) ?? Data()
+        guard UInt64(oldMoovBytes.count) == moov.end - moov.start else {
+            throw IOStreaming.Error.shortRead(expected: moov.end - moov.start,
+                                              actual: UInt64(oldMoovBytes.count))
+        }
 
         let newIlst = Self.buildIlst(entries: entries, cover: cover)
         let newMoov = Self.rebuildMoov(originalMoov: oldMoovBytes, newIlst: newIlst)
@@ -163,22 +183,19 @@ struct MP4File {
             patchedMoov = newMoov
         }
 
-        // Reassemble: top-level atoms in order, swapping moov for patchedMoov.
-        var out = Data()
-        out.reserveCapacity(original.count + max(0, Int(delta)))
-        for (i, atom) in topAtoms.enumerated() {
-            if i == moovIdx {
-                out.append(patchedMoov)
-            } else {
-                out.append(original.subdata(in: Int(atom.start)..<Int(atom.end)))
+        try IOStreaming.writeAtomically(to: url) { tmp in
+            let destination = try FileHandle(forWritingTo: tmp)
+            defer { try? destination.close() }
+            for (i, atom) in topAtoms.enumerated() {
+                if i == moovIdx {
+                    try destination.write(contentsOf: patchedMoov)
+                } else {
+                    try source.seek(toOffset: atom.start)
+                    try IOStreaming.stream(from: source, into: destination,
+                                           byteCount: atom.end - atom.start)
+                }
             }
         }
-
-        // Atomic replace.
-        let tmp = url.deletingLastPathComponent()
-            .appendingPathComponent(".\(url.lastPathComponent).tmp-\(UUID().uuidString)")
-        try out.write(to: tmp, options: .atomic)
-        _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
     }
 
     // MARK: - Building moov / ilst

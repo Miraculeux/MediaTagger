@@ -27,7 +27,7 @@ enum DFFError: Error, LocalizedError {
 struct DFFFile {
 
     let url: URL
-    /// Raw payload of the embedded "ID3 " chunk (a complete ID3v2 tag), if any.
+    /// Embedded ID3v2 tag (if any); summary reads retain title/track frames only.
     let id3Chunk: Data?
     /// Stream-level audio properties read from FRM8/PROP/SND sub-chunks.
     let techInfo: MediaTechnicalInfo
@@ -39,7 +39,7 @@ struct DFFFile {
     /// read its 12-byte chunk header to learn its size, never its payload.
     /// `Data(contentsOf: .mappedIfSafe)` quietly falls back to a full file
     /// copy on non-local volumes, which made sidebar prefetch O(file_bytes).
-    static func read(_ url: URL) throws -> DFFFile {
+    static func read(_ url: URL, summaryOnly: Bool = false) throws -> DFFFile {
         let h = try FileHandle(forReadingFrom: url)
         defer { try? h.close() }
         let fileSize = (try? h.seekToEnd()) ?? 0
@@ -62,6 +62,7 @@ struct DFFFile {
         var dsdDataSize: UInt64 = 0
 
         while p + 12 <= fileSize {
+            if summaryOnly { try Task.checkCancellation() }
             try h.seek(toOffset: p)
             let chunkHeader = h.readData(ofLength: 12)
             guard chunkHeader.count == 12 else { break }
@@ -72,8 +73,14 @@ struct DFFFile {
             let payloadLen = Int(payloadEnd - payloadStart)
             switch id {
             case "ID3 ":
-                id3 = h.readData(ofLength: payloadLen)
-                if id3?.count != payloadLen { id3 = nil }
+                if summaryOnly {
+                    id3 = try? ID3v2File.readSummaryTag(
+                        handle: h, offset: payloadStart, available: UInt64(payloadLen))
+                    try Task.checkCancellation()
+                } else {
+                    id3 = h.readData(ofLength: payloadLen)
+                    if id3?.count != payloadLen { id3 = nil }
+                }
             case "PROP" where payloadLen >= 4:
                 // PROP/SND is typically <200 bytes — read the whole payload.
                 let body = h.readData(ofLength: payloadLen)

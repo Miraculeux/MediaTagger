@@ -111,14 +111,14 @@ final class AVIFileTests: XCTestCase {
         XCTAssertEqual(Int(riffSize), raw.count - 8)
     }
 
-    func testMetadataServiceAVIRoundTrip() throws {
+    func testMetadataServiceAVIRoundTrip() async throws {
         let svc = MetadataService()
-        var md = try svc.read(fileURL)
+        var md = try await svc.read(fileURL)
         md.setTag("TITLE", "From Service")
         md.setTag("ARTIST", "Pal")
         try svc.write(md, to: fileURL)
 
-        let again = try svc.read(fileURL)
+        let again = try await svc.read(fileURL)
         XCTAssertEqual(again.title, "From Service")
         XCTAssertEqual(again.first("ARTIST"), "Pal")
     }

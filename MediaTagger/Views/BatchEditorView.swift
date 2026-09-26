@@ -84,7 +84,7 @@ struct BatchEditorView: View {
         let url = first.url
         prefillTask = Task { @MainActor in
             let md: MediaMetadata? = await Task.detached(priority: .userInitiated) {
-                try? MetadataService().read(url)
+                try? await MetadataService().read(url)
             }.value
             if Task.isCancelled { return }
             guard let md else { return }
@@ -352,7 +352,7 @@ struct BatchEditorView: View {
         let found: Found? = await Task.detached(priority: .userInitiated) {
             let svc = MetadataService()
             for f in files {
-                guard let md = try? svc.read(f.url) else { continue }
+                guard let md = try? await svc.read(f.url) else { continue }
                 if let data = md.coverArt {
                     return Found(data: data, mime: md.coverMimeType)
                 }

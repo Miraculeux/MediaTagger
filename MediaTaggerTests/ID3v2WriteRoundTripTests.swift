@@ -88,15 +88,15 @@ final class ID3v2WriteRoundTripTests: XCTestCase {
         XCTAssertNotNil(raw.range(of: audioMarker))
     }
 
-    func testMetadataServiceRoundTrip() throws {
+    func testMetadataServiceRoundTrip() async throws {
         let svc = MetadataService()
-        var md = try svc.read(fileURL)        // empty initially
+        var md = try await svc.read(fileURL)        // empty initially
         md.setTag("TITLE", "From Service")
         md.setTag("TRACKNUMBER", "5")
         md.setTag("TRACKTOTAL", "10")
         try svc.write(md, to: fileURL)
 
-        let again = try svc.read(fileURL)
+        let again = try await svc.read(fileURL)
         XCTAssertEqual(again.title, "From Service")
         XCTAssertEqual(again.first("TRACKNUMBER"), "5")
         XCTAssertEqual(again.first("TRACKTOTAL"), "10")

@@ -15,7 +15,11 @@ final class AppState: ObservableObject {
     @Published var selectedFileIDs: Set<URL> = []
 
     // Metadata for the currently-selected file
-    @Published var metadata: MediaMetadata?
+    @Published var metadata: MediaMetadata? {
+        didSet { metadataRevision &+= 1 }
+    }
+    @Published private(set) var isSaving = false
+    @Published private(set) var isLoadingMetadata = false
     /// Technical (audio/container) properties for the currently-selected file.
     @Published var technicalInfo: MediaTechnicalInfo?
     @Published var titles: [URL: String] = [:]   // cached titles for the file list
@@ -57,6 +61,9 @@ final class AppState: ObservableObject {
     private var rootBookmark: Data?
     private let bookmarkKey = "rootBookmark"
     private let metadataService = MetadataService()
+    private let metadataWriter: @Sendable (MediaMetadata, URL) throws -> Void
+    private var metadataRevision: UInt64 = 0
+    private var activeSave: (url: URL, task: Task<Void, Error>)?
     /// Cache of stream-level tech info, keyed by URL. Invalidated when the
     /// root folder changes or after a save (which may alter file size).
     private var techInfoCache: [URL: MediaTechnicalInfo] = [:]
@@ -90,8 +97,13 @@ final class AppState: ObservableObject {
     /// arrow-key autorepeat (system default repeat rate is ~30 ms).
     private static let selectionCommitDelay: Duration = .milliseconds(90)
 
-    init() {
+    convenience init() {
+        self.init(metadataWriter: { try MetadataService().write($0, to: $1) })
         restoreRootBookmark()
+    }
+
+    init(metadataWriter: @escaping @Sendable (MediaMetadata, URL) throws -> Void) {
+        self.metadataWriter = metadataWriter
     }
 
     // MARK: - Root folder
@@ -139,6 +151,7 @@ final class AppState: ObservableObject {
         commitSelectionTask = nil
         metadataLoadTask?.cancel()
         metadataLoadTask = nil
+        isLoadingMetadata = false
         do {
             let contents = try FileManager.default.contentsOfDirectory(
                 at: folder,
@@ -170,7 +183,7 @@ final class AppState: ObservableObject {
                         inFlight += 1
                         group.addTask {
                             if Task.isCancelled { return nil }
-                            guard let md = try? service.read(f.url) else { return (f.url, nil, nil) }
+                            guard let md = try? await service.readSummary(f.url) else { return (f.url, nil, nil) }
                             return (f.url, md.title, md.trackDisplay)
                         }
                     }
@@ -266,6 +279,7 @@ final class AppState: ObservableObject {
             // anything when individual rows toggle in/out of the selection.
             metadataLoadTask?.cancel()
             metadataLoadTask = nil
+            isLoadingMetadata = false
             loadGeneration &+= 1
             selectedFile = nil
             metadata = nil
@@ -290,10 +304,14 @@ final class AppState: ObservableObject {
         let token = loadGeneration
         let service = metadataService
         let url = file.url
+        isLoadingMetadata = true
+        let pendingSave = activeSave?.url == url ? activeSave?.task : nil
         // Show cached tech info immediately if we've seen this file in
         // this session; otherwise clear stale tech from the previous file.
         technicalInfo = techInfoCache[url]
         metadataLoadTask = Task.detached(priority: .userInitiated) { [appState = self] in
+            // A reselection during a save must read the replaced file, not its old bytes.
+            if let pendingSave { _ = await pendingSave.result }
             if Task.isCancelled { return }
             let result: Result<(MediaMetadata, MediaTechnicalInfo), Error>
             do { result = .success(try await service.readAll(url)) }
@@ -301,6 +319,7 @@ final class AppState: ObservableObject {
             if Task.isCancelled { return }
             await MainActor.run {
                 guard appState.loadGeneration == token else { return }
+                appState.isLoadingMetadata = false
                 switch result {
                 case .success(let (md, tech)):
                     appState.metadata = md
@@ -318,13 +337,42 @@ final class AppState: ObservableObject {
         if let file { setSelection([file.id]) } else { setSelection([]) }
     }
 
-    func saveCurrent() {
-        guard let file = selectedFile, let md = metadata else { return }
+    func saveCurrent() async {
+        guard !isSaving, !batchInProgress else {
+            lastError = "Another save or batch operation is in progress."
+            return
+        }
+        guard !isLoadingMetadata,
+              let file = selectedFile, selectedFileIDs == [file.id],
+              let md = metadata else { return }
+        let revision = metadataRevision
+        let generation = loadGeneration
+        let folder = selectedFolder
+        let writer = metadataWriter
+        // Navigation can release the old root while the background writer still needs it.
+        let saveRoot = rootURL
+        let retainsRoot = saveRoot?.startAccessingSecurityScopedResource() ?? false
+        isSaving = true
+        lastError = nil
+        let task = Task.detached(priority: .userInitiated) {
+            try writer(md, file.url)
+        }
+        activeSave = (file.url, task)
+        defer {
+            if retainsRoot { saveRoot?.stopAccessingSecurityScopedResource() }
+            isSaving = false
+            activeSave = nil
+        }
         do {
-            try metadataService.write(md, to: file.url)
-            isDirty = false
-            titles[file.url] = md.title ?? file.name
-            tracks[file.url] = md.trackDisplay ?? ""
+            try await task.value
+            if selectedFile?.id == file.id, selectedFileIDs == [file.id],
+               loadGeneration == generation, metadataRevision == revision {
+                isDirty = false
+            }
+            if selectedFolder == folder {
+                titles[file.url] = md.title ?? file.name
+                tracks[file.url] = md.trackDisplay ?? ""
+            }
             // File bytes changed — invalidate cached tech info so we re-read
             // the new file size on the next selection of this URL.
             techInfoCache.removeValue(forKey: file.url)
@@ -383,6 +431,10 @@ final class AppState: ObservableObject {
     /// `renumberTracks` produces the same TRACKNUMBER values regardless of
     /// completion order.
     func applyBatch(_ plan: BatchPlan) {
+        guard !isSaving, !batchInProgress else {
+            lastError = "Another save or batch operation is in progress."
+            return
+        }
         let targets = files.filter { selectedFileIDs.contains($0.id) }
         guard !targets.isEmpty else { return }
         batchInProgress = true
@@ -492,7 +544,7 @@ final class AppState: ObservableObject {
                     group.addTask {
                         do {
                             var currentURL = file.url
-                            var md = (try? service.read(file.url)) ?? MediaMetadata()
+                            var md = try await service.read(file.url)
                             plan.apply(to: &md,
                                        file: file,
                                        indexInSelection: idx,
@@ -664,6 +716,10 @@ final class AppState: ObservableObject {
     /// Skipped silently: directories without audio files, directories without
     /// a candidate cover image, and unreadable files.
     func autoRepairCovers(under root: URL) {
+        guard !isSaving else {
+            lastError = "A file is being saved. Wait before starting a batch operation."
+            return
+        }
         guard !batchInProgress else { return }
         batchInProgress = true
         batchProgress = 0
@@ -827,7 +883,7 @@ final class AppState: ObservableObject {
                 func enqueueNext() {
                     guard !Task.isCancelled, let dir = iter.next() else { return }
                     group.addTask {
-                        return (dir, Self.firstAudioFileMissingCover(in: dir, service: service))
+                        return (dir, await Self.firstAudioFileMissingCover(in: dir, service: service))
                     }
                 }
                 for _ in 0..<maxConcurrent { enqueueNext() }
@@ -947,7 +1003,7 @@ final class AppState: ObservableObject {
                 func enqueueNext() {
                     guard !Task.isCancelled, let file = iter.next() else { return }
                     group.addTask {
-                        guard let md = try? service.read(file) else { return nil }
+                        guard let md = try? await service.read(file) else { return nil }
                         if !AppState.matches(md.album, albumQ)   { return nil }
                         if !AppState.matches(md.artist, artistQ) { return nil }
                         if !AppState.matches(md.title, titleQ)   { return nil }
@@ -1055,7 +1111,7 @@ final class AppState: ObservableObject {
     private nonisolated static func firstAudioFileMissingCover(
         in dir: URL,
         service: MetadataService
-    ) -> Bool {
+    ) async -> Bool {
         let fm = FileManager.default
         guard let items = try? fm.contentsOfDirectory(
             at: dir,
@@ -1068,7 +1124,7 @@ final class AppState: ObservableObject {
                 $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending
             }
         guard let first = audio.first else { return false }
-        guard let md = try? service.read(first) else { return false }
+        guard let md = try? await service.read(first) else { return false }
         return md.coverArt == nil
     }
 
@@ -1090,6 +1146,10 @@ final class AppState: ObservableObject {
     /// 1200 px JPEG` pipeline as cover writes elsewhere in the app, and
     /// rewritten to every audio file in the directory.
     func normalizeEmbeddedCovers(under root: URL) {
+        guard !isSaving else {
+            lastError = "A file is being saved. Wait before starting a batch operation."
+            return
+        }
         guard !batchInProgress else { return }
         batchInProgress = true
         batchProgress = 0
@@ -1214,7 +1274,7 @@ final class AppState: ObservableObject {
         }
 
         // Sample the first file. No cover at all = nothing to normalize.
-        guard let firstMd = try? service.read(first),
+        guard let firstMd = try? await service.read(first),
               let existingCover = firstMd.coverArt
         else {
             return CoverRepairResult(dir: dir, repairedFiles: 0, status: .noCandidate)
@@ -1239,7 +1299,7 @@ final class AppState: ObservableObject {
         for file in audioFiles {
             if Task.isCancelled { break }
             do {
-                var md = (try? service.read(file)) ?? MediaMetadata()
+                var md = try await service.read(file)
                 md.coverArt = normalized
                 md.coverMimeType = "image/jpeg"
                 try service.write(md, to: file)
@@ -1632,7 +1692,7 @@ final class AppState: ObservableObject {
         // Sample the first file: if it already has a cover, treat the whole
         // directory as done. This matches the spec and keeps the scan O(dirs)
         // instead of O(files) on already-tagged libraries.
-        if let firstMd = try? service.read(first), firstMd.coverArt != nil {
+        if let firstMd = try? await service.read(first), firstMd.coverArt != nil {
             return CoverRepairResult(dir: dir, repairedFiles: 0, status: .alreadyCovered)
         }
 
@@ -1665,7 +1725,7 @@ final class AppState: ObservableObject {
         for file in audioFiles {
             if Task.isCancelled { break }
             do {
-                var md = (try? service.read(file)) ?? MediaMetadata()
+                var md = try await service.read(file)
                 md.coverArt = normalized
                 md.coverMimeType = mime
                 try service.write(md, to: file)

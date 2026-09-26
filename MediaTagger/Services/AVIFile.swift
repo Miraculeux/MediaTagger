@@ -37,7 +37,8 @@ struct AVIFile {
     /// `Data(contentsOf:)` so we don't pay a multi-GB mmap (or full copy on
     /// network volumes) just to find a few hundred bytes of INFO chunk.
     /// Total bytes read for a typical AVI: a few hundred KB at most.
-    static func read(_ url: URL) throws -> AVIFile {
+    /// Summary reads seek past INFO values unrelated to title/track.
+    static func read(_ url: URL, summaryOnly: Bool = false) throws -> AVIFile {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
 
@@ -60,6 +61,7 @@ struct AVIFile {
         // skipped over with a single seek().
         var pos: UInt64 = 12
         while pos + 8 <= fileSize {
+            if summaryOnly { try Task.checkCancellation() }
             try handle.seek(toOffset: pos)
             let chdr = handle.readData(ofLength: 8)
             guard chdr.count == 8 else { break }
@@ -72,10 +74,30 @@ struct AVIFile {
                 let listTypeData = handle.readData(ofLength: 4)
                 let listType = String(data: listTypeData, encoding: .ascii) ?? ""
                 if listType == "INFO" {
-                    let bodyLen = Int(payloadEnd - payloadStart - 4)
-                    let body = handle.readData(ofLength: bodyLen)
-                    entries.append(contentsOf:
-                        decodeInfoList(body, start: 0, end: body.count))
+                    if summaryOnly {
+                        var p = payloadStart + 4
+                        while p + 8 <= payloadEnd {
+                            try Task.checkCancellation()
+                            try handle.seek(toOffset: p)
+                            let header = handle.readData(ofLength: 8)
+                            guard header.count == 8 else { break }
+                            let id = String(data: header.prefix(4), encoding: .ascii) ?? ""
+                            let size = UInt64(leU32(header, 4))
+                            let end = min(p + 8 + size, payloadEnd)
+                            if let key = infoIdToKey[id],
+                               key == "TITLE" || key == "TRACKNUMBER" || key == "TRACKTOTAL" {
+                                var chunk = header
+                                chunk.append(handle.readData(ofLength: Int(end - p - 8)))
+                                entries.append(contentsOf: decodeInfoList(chunk, start: 0, end: chunk.count))
+                            }
+                            p = end + (size & 1)
+                        }
+                    } else {
+                        let bodyLen = Int(payloadEnd - payloadStart - 4)
+                        let body = handle.readData(ofLength: bodyLen)
+                        entries.append(contentsOf:
+                            decodeInfoList(body, start: 0, end: body.count))
+                    }
                 }
             }
             // pad byte if size is odd
@@ -110,48 +132,53 @@ struct AVIFile {
 
     static func write(url: URL,
                       entries: [(key: String, value: String)]) throws {
-        let original = try Data(contentsOf: url, options: .mappedIfSafe)
-        guard original.count >= 12,
-              original[0] == 0x52, original[1] == 0x49,
-              original[2] == 0x46, original[3] == 0x46
+        let source = try FileHandle(forReadingFrom: url)
+        defer { try? source.close() }
+        let fileSize = try source.seekToEnd()
+        try source.seek(toOffset: 0)
+        let header = try source.read(upToCount: 12) ?? Data()
+        guard header.count == 12,
+              header[0] == 0x52, header[1] == 0x49,
+              header[2] == 0x46, header[3] == 0x46
         else { throw AVIError.notAVI }
-        let formType = original.subdata(in: 8..<12)
 
-        // Rebuild children, dropping any existing LIST/INFO.
-        var kept = Data()
-        var p = 12
-        while p + 8 <= original.count {
-            let id = String(data: original.subdata(in: p..<p+4), encoding: .ascii) ?? ""
-            let size = Int(leU32(original, p + 4))
-            let payloadStart = p + 8
-            let payloadEnd = min(payloadStart + size, original.count)
-            let chunkEnd = min(payloadEnd + (size & 1), original.count)
-            var skip = false
-            if id == "LIST", payloadEnd - payloadStart >= 4 {
-                let listType = String(data: original.subdata(in: payloadStart..<payloadStart+4),
-                                      encoding: .ascii) ?? ""
-                if listType == "INFO" { skip = true }
+        try IOStreaming.writeAtomically(to: url) { tmp in
+            let destination = try FileHandle(forWritingTo: tmp)
+            defer { try? destination.close() }
+            try destination.write(contentsOf: header)
+
+            var p: UInt64 = 12
+            while p + 8 <= fileSize {
+                try source.seek(toOffset: p)
+                let chunkHeader = try source.read(upToCount: 8) ?? Data()
+                guard chunkHeader.count == 8 else { throw AVIError.truncated }
+                let id = String(data: chunkHeader.prefix(4), encoding: .ascii) ?? ""
+                let size = UInt64(leU32(chunkHeader, 4))
+                let payloadStart = p + 8
+                let payloadEnd = min(payloadStart + size, fileSize)
+                let chunkEnd = min(payloadEnd + (size & 1), fileSize)
+                var skip = false
+                if id == "LIST", payloadEnd - payloadStart >= 4 {
+                    let listType = try source.read(upToCount: 4) ?? Data()
+                    skip = listType == Data("INFO".utf8)
+                }
+                if !skip {
+                    try source.seek(toOffset: p)
+                    try IOStreaming.stream(from: source, into: destination,
+                                           byteCount: chunkEnd - p)
+                }
+                p = chunkEnd
             }
-            if !skip {
-                kept.append(original.subdata(in: p..<chunkEnd))
+
+            try destination.write(contentsOf: buildInfoList(entries: entries))
+            let outputSize = try destination.offset()
+            guard let riffSize = UInt32(exactly: outputSize - 8) else {
+                throw NSError(domain: "MediaTagger.AVI", code: 2,
+                              userInfo: [NSLocalizedDescriptionKey: "AVI exceeds the RIFF size limit"])
             }
-            p = chunkEnd
+            try destination.seek(toOffset: 4)
+            try destination.write(contentsOf: leU32Bytes(riffSize))
         }
-
-        // Build new LIST/INFO from entries.
-        let infoList = buildInfoList(entries: entries)
-        kept.append(infoList)
-
-        var out = Data()
-        out.append(Data("RIFF".utf8))
-        out.append(leU32Bytes(UInt32(4 + kept.count)))   // file size minus header
-        out.append(formType)                              // "AVI "
-        out.append(kept)
-
-        let tmp = url.deletingLastPathComponent()
-            .appendingPathComponent(".\(url.lastPathComponent).tmp-\(UUID().uuidString)")
-        try out.write(to: tmp, options: .atomic)
-        _ = try FileManager.default.replaceItemAt(url, withItemAt: tmp)
     }
 
     private static func buildInfoList(entries: [(key: String, value: String)]) -> Data {

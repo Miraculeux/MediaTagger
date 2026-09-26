@@ -29,7 +29,7 @@ enum DSFError: Error, LocalizedError {
 struct DSFFile {
 
     let url: URL
-    /// Raw payload of the embedded ID3v2 tag (if any).
+    /// Embedded ID3v2 tag (if any); summary reads retain title/track frames only.
     let id3Tag: Data?
     /// Stream-level audio properties read from the DSD/fmt chunks.
     let techInfo: MediaTechnicalInfo
@@ -41,7 +41,7 @@ struct DSFFile {
     /// Streams via `FileHandle` so we never pay a multi-GB mmap (or full
     /// file copy on network volumes) for a DSD album just to fetch a few
     /// KB of ID3 tag. Total bytes read: 80-byte DSD+fmt header + tag body.
-    static func read(_ url: URL) throws -> DSFFile {
+    static func read(_ url: URL, summaryOnly: Bool = false) throws -> DSFFile {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
 
@@ -83,6 +83,12 @@ struct DSFFile {
 
         guard metaPtr > 0, metaPtr < fileSize else {
             return DSFFile(url: url, id3Tag: nil, techInfo: tech)
+        }
+        if summaryOnly {
+            let blob = try? ID3v2File.readSummaryTag(
+                handle: handle, offset: metaPtr, available: fileSize - metaPtr)
+            try Task.checkCancellation()
+            return DSFFile(url: url, id3Tag: blob, techInfo: tech)
         }
         try handle.seek(toOffset: metaPtr)
         let blob = handle.readData(ofLength: Int(fileSize - metaPtr))

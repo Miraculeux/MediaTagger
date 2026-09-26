@@ -128,23 +128,23 @@ final class MatroskaFileTests: XCTestCase {
         XCTAssertEqual(titles.first?.value, "second")
     }
 
-    func testMetadataServiceMatroskaRoundTrip() throws {
+    func testMetadataServiceMatroskaRoundTrip() async throws {
         let svc = MetadataService()
-        var md = try svc.read(fileURL)
+        var md = try await svc.read(fileURL)
         md.setTag("TITLE", "From Service")
         md.setTag("ARTIST", "Pal")
         md.setTag("TRACKNUMBER", "5")
         md.setTag("TRACKTOTAL", "10")
         try svc.write(md, to: fileURL)
 
-        let again = try svc.read(fileURL)
+        let again = try await svc.read(fileURL)
         XCTAssertEqual(again.title, "From Service")
         XCTAssertEqual(again.first("ARTIST"), "Pal")
         XCTAssertEqual(again.first("TRACKNUMBER"), "5")
         XCTAssertEqual(again.first("TRACKTOTAL"), "10")
     }
 
-    func testMetadataServiceWebMRoundTrip() throws {
+    func testMetadataServiceWebMRoundTrip() async throws {
         // Same EBML container; just a different extension. The MetadataService
         // dispatch must accept .webm and the writer must produce a parseable file.
         let webm = URL(fileURLWithPath: NSTemporaryDirectory())
@@ -153,12 +153,12 @@ final class MatroskaFileTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: webm) }
 
         let svc = MetadataService()
-        var md = try svc.read(webm)
+        var md = try await svc.read(webm)
         md.setTag("TITLE", "WebM Title")
         md.setTag("ARTIST", "WebM Artist")
         try svc.write(md, to: webm)
 
-        let again = try svc.read(webm)
+        let again = try await svc.read(webm)
         XCTAssertEqual(again.title, "WebM Title")
         XCTAssertEqual(again.first("ARTIST"), "WebM Artist")
     }

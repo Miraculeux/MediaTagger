@@ -321,6 +321,10 @@ struct MetadataEditorView: View {
                 ErrorChip(message: err) { appState.lastError = nil }
             }
             Spacer()
+            if appState.isSaving {
+                ProgressView().controlSize(.small)
+                Text("Saving...").font(.caption)
+            }
             if appState.isDirty {
                 Text("Unsaved changes").font(.caption).foregroundStyle(.orange)
             }
@@ -328,9 +332,10 @@ struct MetadataEditorView: View {
                 if let f = appState.selectedFile { appState.selectFile(f) }
             }
             .disabled(!appState.isDirty)
-            Button("Save") { appState.saveCurrent() }
+            Button("Save") { Task { await appState.saveCurrent() } }
                 .keyboardShortcut("s", modifiers: [.command])
-                .disabled(!appState.isDirty)
+                .disabled(!appState.isDirty || appState.isSaving ||
+                          appState.isLoadingMetadata || appState.batchInProgress)
                 .buttonStyle(.borderedProminent)
         }
         .padding(10)

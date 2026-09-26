@@ -39,27 +39,27 @@ final class FlacWriteRoundTripTests: XCTestCase {
         XCTAssertEqual(vc.entries.first(where: { $0.key == "TRACKNUMBER" })?.value, "3")
     }
 
-    func testWriteThroughMetadataService() throws {
+    func testWriteThroughMetadataService() async throws {
         let svc = MetadataService()
-        var md = try svc.read(fileURL)
+        var md = try await svc.read(fileURL)
         md.setTag("TITLE", "Brand New Title")
         md.setTag("TRACKNUMBER", "07")
         try svc.write(md, to: fileURL)
 
-        let again = try svc.read(fileURL)
+        let again = try await svc.read(fileURL)
         XCTAssertEqual(again.title, "Brand New Title")
         XCTAssertEqual(again.first("TRACKNUMBER"), "07")
     }
 
-    func testGrowingMetadataTriggersRewriteAndStillReadable() throws {
+    func testGrowingMetadataTriggersRewriteAndStillReadable() async throws {
         let svc = MetadataService()
-        var md = try svc.read(fileURL)
+        var md = try await svc.read(fileURL)
         // Ridiculously long value to force the metadata area to grow past padding.
         let bigValue = String(repeating: "x", count: 50_000)
         md.setTag("COMMENT", bigValue)
         try svc.write(md, to: fileURL)
 
-        let again = try svc.read(fileURL)
+        let again = try await svc.read(fileURL)
         XCTAssertEqual(again.first("COMMENT")?.count, 50_000)
 
         // Audio data preserved.

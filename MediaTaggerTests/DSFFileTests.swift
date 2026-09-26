@@ -155,16 +155,16 @@ final class DSFFileTests: XCTestCase {
         XCTAssertNotNil(raw.range(of: dsdAudio))
     }
 
-    func testMetadataServiceDSFRoundTrip() throws {
+    func testMetadataServiceDSFRoundTrip() async throws {
         let svc = MetadataService()
-        var md = try svc.read(fileURL)
+        var md = try await svc.read(fileURL)
         md.setTag("TITLE", "From Service")
         md.setTag("ARTIST", "Pal")
         md.setTag("TRACKNUMBER", "5")
         md.setTag("TRACKTOTAL", "10")
         try svc.write(md, to: fileURL)
 
-        let again = try svc.read(fileURL)
+        let again = try await svc.read(fileURL)
         XCTAssertEqual(again.title, "From Service")
         XCTAssertEqual(again.first("ARTIST"), "Pal")
         XCTAssertEqual(again.first("TRACKNUMBER"), "5")

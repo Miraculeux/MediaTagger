@@ -27,11 +27,16 @@ enum IOStreaming {
                        chunkSize: Int = defaultChunkSize) throws {
         var remaining = byteCount
         while remaining > 0 {
-            let toRead = Int(min(UInt64(chunkSize), remaining))
-            let buf = try source.read(upToCount: toRead) ?? Data()
-            if buf.isEmpty { throw Error.shortRead(expected: byteCount, actual: byteCount - remaining) }
-            try dest.write(contentsOf: buf)
-            remaining -= UInt64(buf.count)
+            // FileHandle can autorelease its backing NSData. Drain it per
+            // chunk rather than retaining the entire copy until the caller's
+            // run-loop/task autorelease pool drains.
+            try autoreleasepool {
+                let toRead = Int(min(UInt64(chunkSize), remaining))
+                let buf = try source.read(upToCount: toRead) ?? Data()
+                if buf.isEmpty { throw Error.shortRead(expected: byteCount, actual: byteCount - remaining) }
+                try dest.write(contentsOf: buf)
+                remaining -= UInt64(buf.count)
+            }
         }
     }
 

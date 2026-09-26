@@ -45,6 +45,22 @@ its own dependency-free parser/writer:
 Writers prefer in-place updates (e.g. FLAC padding, ID3v2 padding) and fall
 back to atomic rewrites when the new tag area doesn't fit.
 
+### Large libraries and files
+
+- Metadata reads are asynchronous, including the AVFoundation fallback;
+  no worker thread waits on a semaphore for AVFoundation to finish.
+- Directory prefetch uses `MetadataService.readSummary` for title and track
+  display. Native readers skip embedded artwork/attachments before loading
+  their payloads; full editor reads still include cover art.
+- Single-file saves run off the main actor and show a saving indicator.
+  Editing and navigation remain available, and finishing a save does not
+  clear edits made after that save started. Overlapping single-file and
+  batch writes are rejected.
+- MP4, Matroska, AIFF and AVI rewrites stream unchanged media into an atomic
+  replacement file instead of assembling the entire file in memory.
+  Media copying uses fixed-size buffers; metadata itself still needs memory.
+  Rewrites still require temporary disk space roughly equal to the file size.
+
 ## Playback
 
 [PlayerView](MediaTagger/Views/PlayerView.swift) wraps `AVPlayerView` directly
@@ -94,6 +110,10 @@ open MediaTagger.xcodeproj
 ```
 
 Then ⌘R. Targets `arm64` only, macOS 14+.
+
+Compiler warnings are treated as errors for both the app and test targets
+in Debug and Release builds. This is configured in [project.yml](project.yml)
+for Swift and C/Objective-C compilers and survives Xcode project regeneration.
 
 VS Code tasks are also provided:
 

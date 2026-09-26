@@ -21,6 +21,14 @@ enum ID3Error: Error, LocalizedError {
     }
 }
 
+/// The two operations needed to scan a tag without buffering skipped frames.
+protocol ID3TagReader {
+    func readData(ofLength length: Int) -> Data
+    func seek(toOffset offset: UInt64) throws
+}
+
+extension FileHandle: ID3TagReader {}
+
 /// In-memory representation of an MP3 file's ID3v2 tag plus the rest of the
 /// file body (audio + optional ID3v1 trailer) preserved verbatim.
 struct ID3v2File {
@@ -37,7 +45,8 @@ struct ID3v2File {
     /// the audio body during a read (sidebar title prefetch + tag editor
     /// don't need it), so retitling pre-flight on a 500 MB MP3 reads ~tag
     /// size, not the whole file.
-    static func read(_ url: URL) throws -> ID3v2File {
+    /// Summary reads retain TIT2/TRCK only, seeking past every other frame.
+    static func read(_ url: URL, summaryOnly: Bool = false) throws -> ID3v2File {
         let h = try FileHandle(forReadingFrom: url)
         defer { try? h.close() }
         let head = h.readData(ofLength: 10)
@@ -49,6 +58,10 @@ struct ID3v2File {
             // file via `parse(_:url:)` on the full data they already have.
             return ID3v2File(url: url, frames: [], body: Data())
         }
+        if summaryOnly {
+            let fileSize = try h.seekToEnd()
+            return try parse(readSummaryTag(handle: h, offset: 0, available: fileSize), url: url)
+        }
         let tagSize = Int(syncsafe(head[6], head[7], head[8], head[9]))
         try h.seek(toOffset: 0)
         let tag = h.readData(ofLength: 10 + tagSize)
@@ -56,6 +69,61 @@ struct ID3v2File {
         // Reuse the existing parser; the body field will be empty for the
         // file-handle path (parse fills it with everything past the tag).
         return try parse(tag, url: url)
+    }
+
+    /// Build a small tag containing only sidebar frames. Embedded-ID3 containers
+    /// reuse this reader and the normal parser/decoder, without loading APIC.
+    static func readSummaryTag(handle: any ID3TagReader, offset: UInt64,
+                               available: UInt64) throws -> Data {
+        try Task.checkCancellation()
+        guard available >= 10 else { throw ID3Error.truncated }
+        try handle.seek(toOffset: offset)
+        var head = handle.readData(ofLength: 10)
+        guard head.count == 10 else { throw ID3Error.truncated }
+        guard head.prefix(3) == Data("ID3".utf8) else { return head }
+        let major = head[3]
+        let tagSize = Int(syncsafe(head[6], head[7], head[8], head[9]))
+        guard UInt64(10 + tagSize) <= available else { throw ID3Error.truncated }
+        let end = 10 + tagSize
+        var p = 10
+        if head[5] & 0x40 != 0, p + 4 <= end {
+            let sizeBytes = handle.readData(ofLength: 4)
+            guard sizeBytes.count == 4 else { throw ID3Error.truncated }
+            p += major >= 4
+                ? Int(syncsafe(sizeBytes[0], sizeBytes[1], sizeBytes[2], sizeBytes[3]))
+                : Int(beUInt32(sizeBytes, 0)) + 4
+        }
+        var frames = Data()
+        while p + 10 <= end {
+            try Task.checkCancellation()
+            try handle.seek(toOffset: offset + UInt64(p))
+            let header = handle.readData(ofLength: 10)
+            guard header.count == 10 else { throw ID3Error.truncated }
+            if header[0] == 0 { break }
+            let id = String(bytes: header.prefix(4), encoding: .ascii) ?? "????"
+            let size = major >= 4
+                ? Int(syncsafe(header[4], header[5], header[6], header[7]))
+                : Int(beUInt32(header, 4))
+            let dataStart = p + 10
+            guard dataStart + size <= end else { break }
+            if id == "TIT2" || id == "TRCK" {
+                let payload = handle.readData(ofLength: size)
+                guard payload.count == size else { throw ID3Error.truncated }
+                frames.append(header)
+                frames.append(payload)
+            }
+            p = dataStart + size
+        }
+        // The retained frames keep their original version/encoding. The
+        // extended header is omitted, so clear its flag and adjust tag size.
+        head[5] &= ~0x40
+        let size = frames.count
+        head[6] = UInt8((size >> 21) & 0x7F)
+        head[7] = UInt8((size >> 14) & 0x7F)
+        head[8] = UInt8((size >> 7) & 0x7F)
+        head[9] = UInt8(size & 0x7F)
+        head.append(frames)
+        return head
     }
 
     static func parse(_ data: Data, url: URL) throws -> ID3v2File {

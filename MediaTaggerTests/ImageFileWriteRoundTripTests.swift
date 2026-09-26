@@ -63,14 +63,14 @@ final class ImageFileWriteRoundTripTests: XCTestCase {
         XCTAssertEqual(kv["GPS:LongitudeRef"], "W")
     }
 
-    func testWriteThroughMetadataService() throws {
+    func testWriteThroughMetadataService() async throws {
         let svc = MetadataService()
-        var md = try svc.read(fileURL)
+        var md = try await svc.read(fileURL)
         md.setTag("IPTC:Byline", "Service Path")
         md.setTag("EXIF:DateTimeOriginal", "2026:05:12 10:00:00")
         try svc.write(md, to: fileURL)
 
-        let again = try svc.read(fileURL)
+        let again = try await svc.read(fileURL)
         XCTAssertEqual(again.first("IPTC:Byline"), "Service Path")
         XCTAssertEqual(again.first("EXIF:DateTimeOriginal"), "2026:05:12 10:00:00")
     }

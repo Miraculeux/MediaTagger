@@ -145,16 +145,16 @@ final class DFFFileTests: XCTestCase {
         XCTAssertEqual(Int(frm8Size), raw.count - 12)
     }
 
-    func testMetadataServiceDFFRoundTrip() throws {
+    func testMetadataServiceDFFRoundTrip() async throws {
         let svc = MetadataService()
-        var md = try svc.read(fileURL)
+        var md = try await svc.read(fileURL)
         md.setTag("TITLE", "From Service")
         md.setTag("ARTIST", "Pal")
         md.setTag("TRACKNUMBER", "5")
         md.setTag("TRACKTOTAL", "10")
         try svc.write(md, to: fileURL)
 
-        let again = try svc.read(fileURL)
+        let again = try await svc.read(fileURL)
         XCTAssertEqual(again.title, "From Service")
         XCTAssertEqual(again.first("ARTIST"), "Pal")
         XCTAssertEqual(again.first("TRACKNUMBER"), "5")

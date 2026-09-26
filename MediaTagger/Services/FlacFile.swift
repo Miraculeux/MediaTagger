@@ -67,9 +67,13 @@ struct FlacFile {
     /// `Data(contentsOf:, .mappedIfSafe)` silently falls back to a full
     /// file copy on non-local volumes, which made sidebar title precompute
     /// O(album_bytes) instead of O(metadata_bytes).
-    static func read(_ url: URL) throws -> FlacFile {
+    /// Summary reads retain only Vorbis comments and seek past all other blocks;
+    /// the resulting partial model is for reading, not rewriting the file.
+    static func read(_ url: URL, summaryOnly: Bool = false) throws -> FlacFile {
         let handle = try FileHandle(forReadingFrom: url)
         defer { try? handle.close() }
+        let fileSize = summaryOnly ? try handle.seekToEnd() : 0
+        if summaryOnly { try handle.seek(toOffset: 0) }
 
         // Optional ID3v2 prefix: peek 10 bytes, parse syncsafe size, then
         // read the whole tag back in (we preserve it verbatim on write).
@@ -84,9 +88,14 @@ struct FlacFile {
                 | Int(head[9] & 0x7F)
             let footer = (flags & 0x10) != 0 ? 10 : 0
             let totalID3 = 10 + tagSize + footer
-            try handle.seek(toOffset: 0)
-            prefix = handle.readData(ofLength: totalID3)
-            guard prefix.count == totalID3 else { throw FlacError.truncated }
+            if summaryOnly {
+                guard UInt64(totalID3) <= fileSize else { throw FlacError.truncated }
+                try handle.seek(toOffset: UInt64(totalID3))
+            } else {
+                try handle.seek(toOffset: 0)
+                prefix = handle.readData(ofLength: totalID3)
+                guard prefix.count == totalID3 else { throw FlacError.truncated }
+            }
             startOffset = totalID3
         } else {
             try handle.seek(toOffset: UInt64(startOffset))
@@ -101,15 +110,21 @@ struct FlacFile {
         var blocks: [FlacBlock] = []
         var p = startOffset + 4
         while true {
+            if summaryOnly { try Task.checkCancellation() }
             let header = handle.readData(ofLength: 4)
             guard header.count == 4 else { throw FlacError.truncated }
             let isLast = (header[0] & 0x80) != 0
             let type = header[0] & 0x7F
             let len = (Int(header[1]) << 16) | (Int(header[2]) << 8) | Int(header[3])
             p += 4
-            let body = handle.readData(ofLength: len)
-            guard body.count == len else { throw FlacError.truncated }
-            blocks.append(FlacBlock(isLast: isLast, type: type, data: body))
+            if summaryOnly && type != FlacBlockType.vorbisComment {
+                guard UInt64(p + len) <= fileSize else { throw FlacError.truncated }
+                try handle.seek(toOffset: UInt64(p + len))
+            } else {
+                let body = handle.readData(ofLength: len)
+                guard body.count == len else { throw FlacError.truncated }
+                blocks.append(FlacBlock(isLast: isLast, type: type, data: body))
+            }
             p += len
             if isLast { break }
         }

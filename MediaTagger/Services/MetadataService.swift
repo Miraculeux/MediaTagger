@@ -2,56 +2,61 @@ import Foundation
 import AVFoundation
 import AppKit
 
-private final class LockedResult<Value>: @unchecked Sendable {
-    private let lock = NSLock()
-    private var result: Result<Value, Error>?
-
-    func set(_ result: Result<Value, Error>) {
-        lock.withLock { self.result = result }
-    }
-
-    func get() -> Result<Value, Error> {
-        lock.withLock { result! }
-    }
-}
-
 /// Front-door for reading and writing media metadata.
-/// FLAC is handled natively (full read+write); other formats are read via
-/// `AVAsset` (read-only for now). Stage 2 can extend writing for MP3/M4A.
+/// Native parsers handle writable formats; AVFoundation is an async,
+/// read-only fallback. Call synchronous writers from a background task.
 struct MetadataService {
 
-    func read(_ url: URL) throws -> MediaMetadata {
+    struct Summary: Equatable {
+        let title: String?
+        let trackDisplay: String?
+    }
+
+    func read(_ url: URL) async throws -> MediaMetadata {
+        let md = try await read(url, summaryOnly: false)
+        try Task.checkCancellation()
+        return md
+    }
+
+    func readSummary(_ url: URL) async throws -> Summary {
+        let md = try await read(url, summaryOnly: true)
+        try Task.checkCancellation()
+        return Summary(title: md.title, trackDisplay: md.trackDisplay)
+    }
+
+    private func read(_ url: URL, summaryOnly: Bool) async throws -> MediaMetadata {
+        try Task.checkCancellation()
         switch url.pathExtension.lowercased() {
-        case "flac": return try readFlac(url)
-        case "mp3":  return try readMP3(url)
+        case "flac": return try readFlac(url, summaryOnly: summaryOnly)
+        case "mp3":  return try readMP3(url, summaryOnly: summaryOnly)
         case "m4a", "m4b", "mp4", "m4v", "mov", "alac":
-            return try readMP4(url)
+            return try readMP4(url, summaryOnly: summaryOnly)
         case "aiff", "aif", "aifc":
-            return try readAIFF(url)
+            return try readAIFF(url, summaryOnly: summaryOnly)
         case "mka", "mkv", "webm":
-            return try readMatroska(url)
+            return try readMatroska(url, summaryOnly: summaryOnly)
         case "avi":
-            return try readAVI(url)
+            return try readAVI(url, summaryOnly: summaryOnly)
         case "dsf":
-            return try readDSF(url)
+            return try readDSF(url, summaryOnly: summaryOnly)
         case "dff":
-            return try readDFF(url)
+            return try readDFF(url, summaryOnly: summaryOnly)
         case let ext where MediaFile.imageExtensions.contains(ext):
             return readImage(url)
-        default:     return try readAVAssetSynchronously(url)
+        default: return try await readAVAsset(url, summaryOnly: summaryOnly)
         }
     }
 
-    func readTitle(of url: URL) throws -> String? {
-        try read(url).title
+    func readTitle(of url: URL) async throws -> String? {
+        try await readSummary(url).title
     }
 
     /// Read both metadata and stream-level tech info in a single pass when
     /// the format allows it. For FLAC/DSF/DFF this means **one** file scan
-    /// produces both results; for AV-backed formats we run the metadata
-    /// native metadata readers remain synchronous while AVAsset metadata and
-    /// tech-info properties use their modern asynchronous loading APIs.
+    /// produces both results. Native metadata readers remain synchronous;
+    /// AVAsset metadata and tech info use asynchronous loading APIs.
     func readAll(_ url: URL) async throws -> (MediaMetadata, MediaTechnicalInfo) {
+        try Task.checkCancellation()
         let fileSize = (try? FileManager.default
             .attributesOfItem(atPath: url.path)[.size] as? Int64) ?? nil
         let container = url.pathExtension.uppercased()
@@ -82,16 +87,11 @@ struct MetadataService {
                         TechnicalInfoService.from(image: info, fileSize: fileSize)))
 
         default:
-            let md: MediaMetadata
-            switch url.pathExtension.lowercased() {
-            case "mp3", "m4a", "m4b", "mp4", "m4v", "mov", "alac",
-                 "aiff", "aif", "aifc", "mka", "mkv", "webm", "avi":
-                md = try read(url)
-            default:
-                md = try await readAVAsset(url)
-            }
+            let md = try await read(url)
+            try Task.checkCancellation()
             let tech = await TechnicalInfoService.avFallback(
                 url, container: container, fileSize: fileSize)
+            try Task.checkCancellation()
             return (md, tech)
         }
     }
@@ -153,8 +153,8 @@ struct MetadataService {
 
     // MARK: - FLAC
 
-    private func readFlac(_ url: URL) throws -> MediaMetadata {
-        mediaMetadata(fromFlac: try FlacFile.read(url))
+    private func readFlac(_ url: URL, summaryOnly: Bool) throws -> MediaMetadata {
+        mediaMetadata(fromFlac: try FlacFile.read(url, summaryOnly: summaryOnly))
     }
 
     private func writeFlac(_ md: MediaMetadata, to url: URL) throws {
@@ -182,8 +182,8 @@ struct MetadataService {
 
     // MARK: - MP3 (ID3v2)
 
-    private func readMP3(_ url: URL) throws -> MediaMetadata {
-        let file = try ID3v2File.read(url)
+    private func readMP3(_ url: URL, summaryOnly: Bool) throws -> MediaMetadata {
+        let file = try ID3v2File.read(url, summaryOnly: summaryOnly)
         let (entries, cover) = file.decoded()
         var md = MediaMetadata(
             vendor: nil,
@@ -209,9 +209,9 @@ struct MetadataService {
 
     // MARK: - MP4 / M4A (iTunes-style atoms)
 
-    private func readMP4(_ url: URL) throws -> MediaMetadata {
+    private func readMP4(_ url: URL, summaryOnly: Bool) throws -> MediaMetadata {
         let file = try MP4File.read(url)
-        let (entries, cover) = file.decoded()
+        let (entries, cover) = file.decoded(summaryOnly: summaryOnly)
         var md = MediaMetadata(
             vendor: nil,
             tags: entries.map { MediaMetadata.Tag(key: $0.key, value: $0.value) }
@@ -238,8 +238,8 @@ struct MetadataService {
 
     // MARK: - AIFF (ID3v2 inside FORM)
 
-    private func readAIFF(_ url: URL) throws -> MediaMetadata {
-        let file = try AIFFFile.read(url)
+    private func readAIFF(_ url: URL, summaryOnly: Bool) throws -> MediaMetadata {
+        let file = try AIFFFile.read(url, summaryOnly: summaryOnly)
         let (entries, cover) = file.decoded()
         var md = MediaMetadata(
             vendor: nil,
@@ -265,8 +265,8 @@ struct MetadataService {
 
     // MARK: - Matroska (MKV / MKA)
 
-    private func readMatroska(_ url: URL) throws -> MediaMetadata {
-        let file = try MatroskaFile.read(url)
+    private func readMatroska(_ url: URL, summaryOnly: Bool) throws -> MediaMetadata {
+        let file = try MatroskaFile.read(url, summaryOnly: summaryOnly)
         var md = MediaMetadata(
             vendor: nil,
             tags: file.entries.map { MediaMetadata.Tag(key: $0.key, value: $0.value) }
@@ -291,8 +291,8 @@ struct MetadataService {
 
     // MARK: - AVI (RIFF INFO)
 
-    private func readAVI(_ url: URL) throws -> MediaMetadata {
-        let file = try AVIFile.read(url)
+    private func readAVI(_ url: URL, summaryOnly: Bool) throws -> MediaMetadata {
+        let file = try AVIFile.read(url, summaryOnly: summaryOnly)
         return MediaMetadata(
             vendor: nil,
             tags: file.entries.map { MediaMetadata.Tag(key: $0.key, value: $0.value) }
@@ -306,8 +306,8 @@ struct MetadataService {
 
     // MARK: - DSF (DSD Stream File, ID3v2 trailer)
 
-    private func readDSF(_ url: URL) throws -> MediaMetadata {
-        mediaMetadata(fromID3Decoded: try DSFFile.read(url).decoded())
+    private func readDSF(_ url: URL, summaryOnly: Bool) throws -> MediaMetadata {
+        mediaMetadata(fromID3Decoded: try DSFFile.read(url, summaryOnly: summaryOnly).decoded())
     }
 
     private func writeDSF(_ md: MediaMetadata, to url: URL) throws {
@@ -323,8 +323,8 @@ struct MetadataService {
 
     // MARK: - DFF (DSDIFF, ID3v2 inside FRM8)
 
-    private func readDFF(_ url: URL) throws -> MediaMetadata {
-        mediaMetadata(fromID3Decoded: try DFFFile.read(url).decoded())
+    private func readDFF(_ url: URL, summaryOnly: Bool) throws -> MediaMetadata {
+        mediaMetadata(fromID3Decoded: try DFFFile.read(url, summaryOnly: summaryOnly).decoded())
     }
 
     private func writeDFF(_ md: MediaMetadata, to url: URL) throws {
@@ -364,19 +364,7 @@ struct MetadataService {
 
     // MARK: - AVAsset (read-only fallback)
 
-    private func readAVAssetSynchronously(_ url: URL) throws -> MediaMetadata {
-        let semaphore = DispatchSemaphore(value: 0)
-        let result = LockedResult<MediaMetadata>()
-        Task {
-            do { result.set(.success(try await readAVAsset(url))) }
-            catch { result.set(.failure(error)) }
-            semaphore.signal()
-        }
-        semaphore.wait()
-        return try result.get().get()
-    }
-
-    private func readAVAsset(_ url: URL) async throws -> MediaMetadata {
+    private func readAVAsset(_ url: URL, summaryOnly: Bool) async throws -> MediaMetadata {
         let asset = AVURLAsset(url: url)
         var tags: [MediaMetadata.Tag] = []
         var cover: Data?
@@ -387,8 +375,12 @@ struct MetadataService {
         let loadedItems = try await commonMetadata + metadata
 
         for item in loadedItems {
+            try Task.checkCancellation()
             let key = (item.commonKey?.rawValue ?? item.key as? String ?? "").uppercased()
             if key.isEmpty { continue }
+            if summaryOnly && !["TITLE", "TRACKNUMBER", "TRACKTOTAL"].contains(mapCommonKey(key)) {
+                continue
+            }
             if let str = try? await item.load(.stringValue) {
                 tags.append(.init(key: mapCommonKey(key), value: str))
             } else if (key.contains("ARTWORK") || key.contains("COVER") || key == "PIC"),
@@ -396,6 +388,7 @@ struct MetadataService {
                 cover = data
                 coverMime = mimeForImageData(data)
             }
+            try Task.checkCancellation()
         }
         return MediaMetadata(vendor: nil, tags: tags, coverArt: cover, coverMimeType: coverMime)
     }

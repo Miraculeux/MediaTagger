@@ -206,19 +206,19 @@ final class MP4FileTests: XCTestCase {
         XCTAssertEqual(titles.first?.value, "second")
     }
 
-    func testMetadataServiceM4ARoundTrip() throws {
+    func testMetadataServiceM4ARoundTrip() async throws {
         let mdatPayload = Data((0..<32).map { _ in UInt8(0x42) })
         let mp4 = makeMinimalMP4(mdatPayload: mdatPayload, chunkOffsetsInMdat: [0])
         try mp4.write(to: fileURL)
 
         let svc = MetadataService()
-        var md = try svc.read(fileURL)
+        var md = try await svc.read(fileURL)
         md.setTag("TITLE", "From Service")
         md.setTag("TRACKNUMBER", "5")
         md.setTag("TRACKTOTAL", "10")
         try svc.write(md, to: fileURL)
 
-        let again = try svc.read(fileURL)
+        let again = try await svc.read(fileURL)
         XCTAssertEqual(again.title, "From Service")
         XCTAssertEqual(again.first("TRACKNUMBER"), "5")
         XCTAssertEqual(again.first("TRACKTOTAL"), "10")
