@@ -1,7 +1,7 @@
 import SwiftUI
 import AppKit
 
-private struct FileListRow: Identifiable {
+struct FileListRow: Identifiable {
     let file: MediaFile
     let title: String?
     let track: String
@@ -9,6 +9,28 @@ private struct FileListRow: Identifiable {
     var id: URL { file.id }
     var fileSortValue: String { file.name }
     var titleSortValue: String { title ?? "" }
+    var trackSortValue: String {
+        String(track.prefix { $0 != "/" }).trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    func orderedBefore(_ other: FileListRow, by field: FileListSortField, ascending: Bool) -> Bool {
+        var result: ComparisonResult
+        switch field {
+        case .file:
+            result = fileSortValue.localizedStandardCompare(other.fileSortValue)
+        case .title:
+            result = titleSortValue.localizedStandardCompare(other.titleSortValue)
+        case .track:
+            result = trackSortValue.compare(other.trackSortValue, options: [.numeric, .caseInsensitive])
+        }
+        if result == .orderedSame {
+            result = fileSortValue.localizedStandardCompare(other.fileSortValue)
+        }
+        if result == .orderedSame {
+            result = id.path.compare(other.id.path)
+        }
+        return ascending ? result == .orderedAscending : result == .orderedDescending
+    }
 }
 
 private struct FileListDisplayRow: Identifiable {
@@ -16,9 +38,10 @@ private struct FileListDisplayRow: Identifiable {
     let value: FileListRow
 }
 
-private enum FileListSortField {
+enum FileListSortField {
     case file
     case title
+    case track
 }
 
 /// Middle pane: list of media files in the selected folder.
@@ -38,22 +61,7 @@ struct FileListView: View {
     }
 
     private var sortedRows: [FileListRow] {
-        rows.sorted { lhs, rhs in
-            var result: ComparisonResult
-            switch sortField {
-            case .file:
-                result = lhs.fileSortValue.localizedStandardCompare(rhs.fileSortValue)
-            case .title:
-                result = lhs.titleSortValue.localizedStandardCompare(rhs.titleSortValue)
-                if result == .orderedSame {
-                    result = lhs.fileSortValue.localizedStandardCompare(rhs.fileSortValue)
-                }
-            }
-            if result == .orderedSame {
-                result = lhs.id.path.compare(rhs.id.path)
-            }
-            return sortAscending ? result == .orderedAscending : result == .orderedDescending
-        }
+        rows.sorted { $0.orderedBefore($1, by: sortField, ascending: sortAscending) }
     }
 
     private var displayRows: [FileListDisplayRow] {
@@ -141,9 +149,9 @@ struct FileListView: View {
 
     private var tableHeader: some View {
         HStack(spacing: 0) {
-            Text("#")
-                .padding(.leading, 8)
+            sortButton("#", field: .track)
                 .frame(width: 60, alignment: .leading)
+                .help("Sort by track number")
             Divider()
             sortButton("File", field: .file)
             Divider()

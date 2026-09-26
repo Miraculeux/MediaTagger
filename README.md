@@ -12,7 +12,9 @@ Three-pane `NavigationSplitView`:
    navigator rooted at a user-chosen folder.
 2. **File list** ([FileListView](MediaTagger/Views/FileListView.swift)) — media
    files in the selected folder with their `TITLE` tag. Supports multi-selection
-   for batch editing.
+   for batch editing. Click `#`, `File`, or `Title` to sort; click again to
+   reverse the order. Track sorting compares the number before `/`, ignoring
+   leading zeros and track totals, with filename/path tie-breakers.
 3. **Detail pane** ([DetailPane](MediaTagger/Views/DetailPane.swift)) —
    - [PlayerView](MediaTagger/Views/PlayerView.swift): inline AVKit transport
      for supported formats.
