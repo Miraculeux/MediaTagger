@@ -33,18 +33,8 @@ struct SidebarView: View {
                     } else if let hits = appState.coverlessFolders {
                         coverlessResults(hits: hits)
                     } else if searchText.isEmpty {
-                        List(selection: Binding(
-                            get: { appState.selectedFolder },
-                            set: { if let url = $0 { appState.loadFiles(in: url) } }
-                        )) {
-                            OutlineGroup(node, children: \.children) { node in
-                                Label(node.url.lastPathComponent, systemImage: "folder")
-                                    .tag(node.url)
-                                    .contextMenu { folderContextMenu(for: node.url) }
-                            }
-                        }
-                        .listStyle(.sidebar)
-                        .id(root)
+                        folderTree(node)
+                            .id(root)
                     } else {
                         searchResults(in: node)
                     }
@@ -65,6 +55,17 @@ struct SidebarView: View {
         }
         .onAppear(perform: syncRoot)
         .onChange(of: appState.rootURL) { _, _ in syncRoot() }
+    }
+
+    private func folderTree(_ root: FolderNode) -> some View {
+        NativeFolderTreeView(
+            root: root,
+            selection: Binding(
+                get: { appState.selectedFolder },
+                set: { if let url = $0 { appState.loadFiles(in: url) } }
+            ),
+            menuEntries: folderMenuEntries
+        )
     }
 
     private var toolbar: some View {
@@ -412,29 +413,38 @@ struct SidebarView: View {
         }
     }
 
-    /// Right-click menu shared by the OutlineGroup rows and the search-result
+    /// Right-click menu shared by the folder-tree rows and the search-result
     /// rows. Reveals folder commands that don't fit on the toolbar.
     @ViewBuilder
     private func folderContextMenu(for url: URL) -> some View {
-        Button("Reveal in Finder") {
-            NSWorkspace.shared.activateFileViewerSelecting([url])
+        let entries = folderMenuEntries(for: url)
+        ForEach(entries.indices, id: \.self) { index in
+            switch entries[index] {
+            case .separator:
+                Divider()
+            case .item(let title, let enabled, let action):
+                Button(title, action: action).disabled(!enabled)
+            }
         }
-        Button("Reveal in Seeker") {
-            revealInSeeker(url)
-        }
-        Divider()
-        Button("Find Folders Without Cover…") {
-            appState.findCoverlessFolders(under: url)
-        }
-        .disabled(appState.batchInProgress)
-        Button("Auto-repair Covers in Subfolders…") {
-            confirmAndRepairCovers(under: url)
-        }
-        .disabled(appState.batchInProgress)
-        Button("Normalize Embedded Covers in Subfolders…") {
-            confirmAndNormalizeCovers(under: url)
-        }
-        .disabled(appState.batchInProgress)
+    }
+
+    private func folderMenuEntries(for url: URL) -> [BrowserMenuEntry] {
+        [
+            .item(title: "Reveal in Finder", enabled: true) {
+                NSWorkspace.shared.activateFileViewerSelecting([url])
+            },
+            .item(title: "Reveal in Seeker", enabled: true) { revealInSeeker(url) },
+            .separator,
+            .item(title: "Find Folders Without Cover…", enabled: !appState.batchInProgress) {
+                appState.findCoverlessFolders(under: url)
+            },
+            .item(title: "Auto-repair Covers in Subfolders…", enabled: !appState.batchInProgress) {
+                confirmAndRepairCovers(under: url)
+            },
+            .item(title: "Normalize Embedded Covers in Subfolders…", enabled: !appState.batchInProgress) {
+                confirmAndNormalizeCovers(under: url)
+            }
+        ]
     }
 
     /// Open the folder in the Seeker app via its `seeker://reveal` URL
@@ -491,10 +501,55 @@ struct SidebarView: View {
     }
 }
 
+struct FolderTreeNavigation {
+    struct Row: Identifiable {
+        let node: FolderNode
+        let depth: Int
+        let parent: URL?
+        var id: URL { node.url }
+    }
+
+    var expandedURLs: Set<URL> = []
+
+    func moveVertically(root: FolderNode, selection: URL?, offset: Int) -> URL? {
+        let rows = visibleRows(root: root)
+        guard let index = rows.firstIndex(where: { $0.id == selection }) else {
+            return offset > 0 ? rows.first?.id : rows.last?.id
+        }
+        return rows[min(max(index + offset, 0), rows.count - 1)].id
+    }
+
+    func visibleRows(root: FolderNode) -> [Row] {
+        func rows(_ node: FolderNode, depth: Int, parent: URL?) -> [Row] {
+            var result = [Row(node: node, depth: depth, parent: parent)]
+            if expandedURLs.contains(node.url), let children = node.children {
+                for child in children {
+                    result.append(contentsOf: rows(child, depth: depth + 1, parent: node.url))
+                }
+            }
+            return result
+        }
+        return rows(root, depth: 0, parent: nil)
+    }
+
+    mutating func moveHorizontally(root: FolderNode, selection: URL?, expanding: Bool) -> URL? {
+        guard let row = visibleRows(root: root).first(where: { $0.id == selection }) else {
+            return root.url
+        }
+        if expanding {
+            guard let children = row.node.children else { return row.id }
+            if expandedURLs.insert(row.id).inserted { return row.id }
+            return children.first?.url
+        }
+        if expandedURLs.remove(row.id) != nil { return row.id }
+        return row.parent ?? row.id
+    }
+}
+
 /// Lightweight, lazily-loaded folder tree node.
 ///
 /// Reference type so the per-node `children` cache survives across SwiftUI
-/// view rebuilds. `OutlineGroup` calls `\.children` repeatedly while the
+/// view rebuilds. The folder tree reads `children` repeatedly while the
 /// sidebar redraws (selection changes, focus changes, batch progress
 /// updates, …); without caching, each access re-runs `contentsOfDirectory`
 /// — measurable overhead for large music libraries with deep folder trees

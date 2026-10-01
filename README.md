@@ -9,12 +9,27 @@ dependency-free Swift parsers — no `ffmpeg`, no `taglib`.
 Three-pane `NavigationSplitView`:
 
 1. **Sidebar** ([SidebarView](MediaTagger/Views/SidebarView.swift)) — folder
-   navigator rooted at a user-chosen folder.
+   navigator rooted at a user-chosen folder. With the tree focused, Up/Down
+   selects visible folders, Right expands a folder (or enters its first child),
+   and Left collapses it (or selects its parent). The tree uses a native AppKit
+   outline view: clicking a directory or disclosure triangle explicitly gives
+   it keyboard focus, and arrows are handled directly by its responder.
+   Right-click a folder to reveal it in Finder/Seeker, scan for missing cover
+   art, or repair/normalize covers in its subfolders.
 2. **File list** ([FileListView](MediaTagger/Views/FileListView.swift)) — media
    files in the selected folder with their `TITLE` tag. Supports multi-selection
-   for batch editing. Click `#`, `File`, or `Title` to sort; click again to
+   for batch editing. Defaults to ascending track-number order.
+   Click `#`, `File`, or `Title` to sort; click again to
    reverse the order. Track sorting compares the number before `/`, ignoring
    leading zeros and track totals, with filename/path tie-breakers.
+   Drag the boundaries between column headers to resize columns. Column widths
+   are retained while sorting or updating metadata; wide columns can be reached
+   using the horizontal scrollbar.
+   With the table focused, Up/Down selects files in the displayed sort order
+   and Command-A selects all files in the current folder. These shortcuts
+   leave text selection in search and metadata fields unchanged. The native
+   table explicitly takes keyboard focus when clicked, so switching between
+   the directory tree and file list routes keys to the pane you last clicked.
 3. **Detail pane** ([DetailPane](MediaTagger/Views/DetailPane.swift)) —
    - [PlayerView](MediaTagger/Views/PlayerView.swift): inline AVKit transport
      for supported formats.
@@ -88,6 +103,15 @@ absent the project still builds and the unsupported-format chip is shown
 instead of the VLC player.
 
 ## Batch editing
+
+The single-file editor also provides **Set title from filename**, which fills
+the editable title using the same default cleanup rules as batch editing, and
+**Set filename from title on save**. The latter stages a rename until **Save**:
+metadata is written first, then the file is renamed using the current title.
+The original extension is preserved, unsafe filename characters are cleaned,
+and name collisions receive a numeric suffix instead of overwriting another
+file. Images use their IPTC title (`IPTC:ObjectName`). Changing the selection
+discards the pending rename; failed saves retain it for retry.
 
 [BatchOperations](MediaTagger/Services/BatchOperations.swift) defines a
 declarative `BatchPlan` applied to all selected files:

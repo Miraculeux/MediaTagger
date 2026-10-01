@@ -13,6 +13,7 @@ final class AppState: ObservableObject {
     @Published var selectedFile: MediaFile?
     /// Multi-selection set (file URLs). When count == 1 it stays in sync with `selectedFile`.
     @Published var selectedFileIDs: Set<URL> = []
+    @Published private(set) var filenameFromTitleOnSave = false
 
     // Metadata for the currently-selected file
     @Published var metadata: MediaMetadata? {
@@ -63,7 +64,7 @@ final class AppState: ObservableObject {
     private let metadataService = MetadataService()
     private let metadataWriter: @Sendable (MediaMetadata, URL) throws -> Void
     private var metadataRevision: UInt64 = 0
-    private var activeSave: (url: URL, task: Task<Void, Error>)?
+    private var activeSave: (url: URL, task: Task<URL, Error>)?
     /// Cache of stream-level tech info, keyed by URL. Invalidated when the
     /// root folder changes or after a save (which may alter file size).
     private var techInfoCache: [URL: MediaTechnicalInfo] = [:]
@@ -137,6 +138,7 @@ final class AppState: ObservableObject {
         let scanToken = titleLoadGeneration
         selectedFile = nil
         selectedFileIDs = []
+        filenameFromTitleOnSave = false
         metadata = nil
         technicalInfo = nil
         techInfoCache.removeAll()
@@ -261,6 +263,7 @@ final class AppState: ObservableObject {
     /// only the file the user lands on is fully loaded.
     func setSelection(_ ids: Set<URL>) {
         guard ids != selectedFileIDs else { return }
+        filenameFromTitleOnSave = false
         selectedFileIDs = ids
         isDirty = false
         commitSelectionTask?.cancel()
@@ -310,13 +313,17 @@ final class AppState: ObservableObject {
         // this session; otherwise clear stale tech from the previous file.
         technicalInfo = techInfoCache[url]
         metadataLoadTask = Task.detached(priority: .userInitiated) { [appState = self] in
-            // A reselection during a save must read the replaced file, not its old bytes.
-            if let pendingSave { _ = await pendingSave.result }
+            var readURL = url
+            // A reselection must follow a save's rename as well as its byte replacement.
+            if let pendingSave, case .success(let savedURL) = await pendingSave.result {
+                readURL = savedURL
+            }
             if Task.isCancelled { return }
             let result: Result<(MediaMetadata, MediaTechnicalInfo), Error>
-            do { result = .success(try await service.readAll(url)) }
+            do { result = .success(try await service.readAll(readURL)) }
             catch { result = .failure(error) }
             if Task.isCancelled { return }
+            let loadedURL = readURL
             await MainActor.run {
                 guard appState.loadGeneration == token else { return }
                 appState.isLoadingMetadata = false
@@ -324,7 +331,7 @@ final class AppState: ObservableObject {
                 case .success(let (md, tech)):
                     appState.metadata = md
                     appState.technicalInfo = tech
-                    appState.techInfoCache[url] = tech
+                    appState.techInfoCache[loadedURL] = tech
                 case .failure(let err):
                     appState.lastError = err.localizedDescription
                     appState.metadata = MediaMetadata()
@@ -337,6 +344,35 @@ final class AppState: ObservableObject {
         if let file { setSelection([file.id]) } else { setSelection([]) }
     }
 
+    var canUseFilenameActions: Bool {
+        guard let file = selectedFile else { return false }
+        return selectedFileIDs == [file.id] && metadata != nil &&
+            !isLoadingMetadata && !isSaving && !batchInProgress
+    }
+
+    func setTitleFromFilename() {
+        guard canUseFilenameActions, let file = selectedFile else {
+            lastError = "Select a single file and wait for editing to become available."
+            return
+        }
+        let title = FilenameCleaner.title(from: file.name)
+        guard !title.isEmpty else {
+            lastError = "The filename does not contain a title after cleanup."
+            return
+        }
+        setStandardTag(file.isImage ? "IPTC:ObjectName" : "TITLE", title)
+        lastError = nil
+    }
+
+    func setFilenameFromTitleOnSave(_ enabled: Bool) {
+        guard canUseFilenameActions else {
+            lastError = "Select a single file and wait for editing to become available."
+            return
+        }
+        filenameFromTitleOnSave = enabled
+        lastError = nil
+    }
+
     func saveCurrent() async {
         guard !isSaving, !batchInProgress else {
             lastError = "Another save or batch operation is in progress."
@@ -345,6 +381,13 @@ final class AppState: ObservableObject {
         guard !isLoadingMetadata,
               let file = selectedFile, selectedFileIDs == [file.id],
               let md = metadata else { return }
+        let shouldRename = filenameFromTitleOnSave
+        let title = md.first(file.isImage ? "IPTC:ObjectName" : "TITLE")
+        let filenameStem = FilenameCleaner.filenameStem(from: title ?? "")
+        if shouldRename, filenameStem.isEmpty || filenameStem == "." || filenameStem == ".." {
+            lastError = "Enter a valid title before setting the filename from it."
+            return
+        }
         let revision = metadataRevision
         let generation = loadGeneration
         let folder = selectedFolder
@@ -356,6 +399,14 @@ final class AppState: ObservableObject {
         lastError = nil
         let task = Task.detached(priority: .userInitiated) {
             try writer(md, file.url)
+            if shouldRename {
+                let destination = FilenameCleaner.uniqueSiblingURL(for: file.url, stem: filenameStem)
+                if destination != file.url {
+                    try FileManager.default.moveItem(at: file.url, to: destination)
+                }
+                return destination
+            }
+            return file.url
         }
         activeSave = (file.url, task)
         defer {
@@ -364,20 +415,57 @@ final class AppState: ObservableObject {
             activeSave = nil
         }
         do {
-            try await task.value
-            if selectedFile?.id == file.id, selectedFileIDs == [file.id],
-               loadGeneration == generation, metadataRevision == revision {
+            let savedURL = try await task.value
+            let selectionMatches = selectedFileIDs == [file.id]
+            let stillSelected = selectedFile?.id == file.id && selectionMatches
+            let editsUnchanged = stillSelected && loadGeneration == generation && metadataRevision == revision
+            if savedURL != file.url {
+                let needsReload = selectionMatches && (!stillSelected || isLoadingMetadata)
+                if selectionMatches {
+                    commitSelectionTask?.cancel()
+                    commitSelectionTask = nil
+                    metadataLoadTask?.cancel()
+                    metadataLoadTask = nil
+                    loadGeneration &+= 1
+                    isLoadingMetadata = false
+                }
+                replaceFileURL(file.url, with: savedURL)
+                if needsReload { commitSingleSelection(MediaFile(id: savedURL)) }
+            }
+            if selectionMatches, shouldRename {
+                filenameFromTitleOnSave = false
+            }
+            if editsUnchanged {
                 isDirty = false
             }
             if selectedFolder == folder {
-                titles[file.url] = md.title ?? file.name
-                tracks[file.url] = md.trackDisplay ?? ""
+                titles[savedURL] = title ?? savedURL.lastPathComponent
+                tracks[savedURL] = md.trackDisplay ?? ""
             }
             // File bytes changed — invalidate cached tech info so we re-read
             // the new file size on the next selection of this URL.
-            techInfoCache.removeValue(forKey: file.url)
+            techInfoCache.removeValue(forKey: savedURL)
         } catch {
             lastError = error.localizedDescription
+        }
+    }
+
+    private func replaceFileURL(_ oldURL: URL, with newURL: URL) {
+        if let index = files.firstIndex(where: { $0.id == oldURL }) {
+            files[index] = MediaFile(id: newURL)
+        }
+        if selectedFileIDs.remove(oldURL) != nil {
+            selectedFileIDs.insert(newURL)
+        }
+        if selectedFile?.id == oldURL {
+            selectedFile = MediaFile(id: newURL)
+        }
+        if let title = titles.removeValue(forKey: oldURL) { titles[newURL] = title }
+        if let track = tracks.removeValue(forKey: oldURL) { tracks[newURL] = track }
+        techInfoCache.removeValue(forKey: oldURL)
+        advancedSearchHits = advancedSearchHits?.map { hit in
+            guard hit.url == oldURL else { return hit }
+            return AdvancedSearchHit(url: newURL, title: hit.title, artist: hit.artist, album: hit.album)
         }
     }
 
@@ -459,41 +547,6 @@ final class AppState: ObservableObject {
                 let title: String
                 let track: String
                 let error: String?
-            }
-
-            func sanitizedFilenameStem(from title: String) -> String {
-                var s = title.trimmingCharacters(in: .whitespacesAndNewlines)
-                // Finder disallows ":" and POSIX paths disallow "/".
-                s = s.replacingOccurrences(of: "/", with: "-")
-                s = s.replacingOccurrences(of: ":", with: "-")
-                s = s.replacingOccurrences(of: "\\", with: "-")
-                if let regex = try? NSRegularExpression(pattern: #"\s+"#) {
-                    let range = NSRange(s.startIndex..., in: s)
-                    s = regex.stringByReplacingMatches(in: s, range: range, withTemplate: " ")
-                }
-                // Drop ASCII control characters that can break file operations.
-                s = String(s.unicodeScalars.filter {
-                    let v = $0.value
-                    return v >= 0x20 && v != 0x7F
-                })
-                return s.trimmingCharacters(in: .whitespacesAndNewlines)
-            }
-
-            func uniqueSiblingURL(for source: URL, stem: String) -> URL {
-                let dir = source.deletingLastPathComponent()
-                let ext = source.pathExtension
-                let candidateName = ext.isEmpty ? stem : "\(stem).\(ext)"
-
-                if source.lastPathComponent == candidateName { return source }
-
-                var candidate = dir.appendingPathComponent(candidateName)
-                var n = 2
-                while FileManager.default.fileExists(atPath: candidate.path) {
-                    let numbered = ext.isEmpty ? "\(stem) (\(n))" : "\(stem) (\(n)).\(ext)"
-                    candidate = dir.appendingPathComponent(numbered)
-                    n += 1
-                }
-                return candidate
             }
 
             func normalizedCoverArt(_ data: Data) -> Data? {
@@ -585,9 +638,9 @@ final class AppState: ObservableObject {
 
                             if plan.filenameFromTitle,
                                let title = md.title {
-                                let stem = sanitizedFilenameStem(from: title)
+                                let stem = FilenameCleaner.filenameStem(from: title)
                                 if !stem.isEmpty {
-                                    let destination = uniqueSiblingURL(for: currentURL, stem: stem)
+                                    let destination = FilenameCleaner.uniqueSiblingURL(for: currentURL, stem: stem)
                                     if destination != currentURL {
                                         try FileManager.default.moveItem(at: currentURL, to: destination)
                                         currentURL = destination
@@ -631,23 +684,7 @@ final class AppState: ObservableObject {
                     await MainActor.run {
                         if !didFail {
                             if snapshot.oldURL != snapshot.url {
-                                if let i = appState.files.firstIndex(where: { $0.id == snapshot.oldURL }) {
-                                    appState.files[i] = MediaFile(id: snapshot.url)
-                                }
-                                if appState.selectedFileIDs.contains(snapshot.oldURL) {
-                                    appState.selectedFileIDs.remove(snapshot.oldURL)
-                                    appState.selectedFileIDs.insert(snapshot.url)
-                                }
-                                if appState.selectedFile?.id == snapshot.oldURL {
-                                    appState.selectedFile = MediaFile(id: snapshot.url)
-                                }
-                                if let oldTitle = appState.titles.removeValue(forKey: snapshot.oldURL) {
-                                    appState.titles[snapshot.url] = oldTitle
-                                }
-                                if let oldTrack = appState.tracks.removeValue(forKey: snapshot.oldURL) {
-                                    appState.tracks[snapshot.url] = oldTrack
-                                }
-                                appState.techInfoCache.removeValue(forKey: snapshot.oldURL)
+                                appState.replaceFileURL(snapshot.oldURL, with: snapshot.url)
                             }
                             appState.titles[snapshot.url] = snapshot.title
                             appState.tracks[snapshot.url] = snapshot.track

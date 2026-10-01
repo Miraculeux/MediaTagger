@@ -1,7 +1,7 @@
 import SwiftUI
 import AppKit
 
-struct FileListRow: Identifiable {
+struct FileListRow: Identifiable, Equatable {
     let file: MediaFile
     let title: String?
     let track: String
@@ -33,12 +33,7 @@ struct FileListRow: Identifiable {
     }
 }
 
-private struct FileListDisplayRow: Identifiable {
-    let id: Int
-    let value: FileListRow
-}
-
-enum FileListSortField {
+enum FileListSortField: String {
     case file
     case title
     case track
@@ -47,7 +42,7 @@ enum FileListSortField {
 /// Middle pane: list of media files in the selected folder.
 struct FileListView: View {
     @EnvironmentObject var appState: AppState
-    @State private var sortField: FileListSortField = .file
+    @State private var sortField: FileListSortField = .track
     @State private var sortAscending = true
 
     private var rows: [FileListRow] {
@@ -64,66 +59,30 @@ struct FileListView: View {
         rows.sorted { $0.orderedBefore($1, by: sortField, ascending: sortAscending) }
     }
 
-    private var displayRows: [FileListDisplayRow] {
-        sortedRows.enumerated().map { FileListDisplayRow(id: $0.offset, value: $0.element) }
-    }
-
-    private var displaySelection: Binding<Set<Int>> {
-        Binding(
-            get: {
-                Set(displayRows.compactMap { row in
-                    appState.selectedFileIDs.contains(row.value.id) ? row.id : nil
-                })
-            },
-            set: { positions in
-                let fileIDs = Set(displayRows.compactMap { row in
-                    positions.contains(row.id) ? row.value.id : nil
-                })
-                appState.setSelection(fileIDs)
-            }
-        )
-    }
-
     var body: some View {
         VStack(spacing: 0) {
-            tableHeader
-            Divider()
-                Table(displayRows, selection: displaySelection) {
-                TableColumn("#") { row in
-                    Text(row.value.track)
-                        .font(.system(.body, design: .monospaced))
-                        .foregroundStyle(.secondary)
-                }
-                .width(min: 50, ideal: 60, max: 90)
-                TableColumn("File") { row in
-                    HStack {
-                        Image(systemName: icon(for: row.value.file.ext))
-                            .foregroundStyle(.tint)
-                        Text(row.value.file.name).lineLimit(1)
-                    }
-                }
-                TableColumn("Title") { row in
-                    Text(row.value.title ?? "—")
-                        .foregroundStyle(row.value.title == nil ? .secondary : .primary)
-                        .lineLimit(1)
-                }
-            }
-            .tableColumnHeaders(.hidden)
-            .contextMenu(forSelectionType: Int.self) { positions in
-                // Right-click on a row: ensure the clicked row participates in
-                // the action even if it wasn't already selected.
-                let targets = positions.isEmpty
-                    ? appState.selectedFileIDs
-                    : Set(displayRows.compactMap { row in
-                        positions.contains(row.id) ? row.value.id : nil
-                    })
-                Button("Reveal in Finder") { revealInFinder(targets) }
-                    .disabled(targets.isEmpty)
-                Button("Reveal in Seeker") { revealInSeeker(targets) }
-                    .disabled(targets.isEmpty)
-                Divider()
-                Button("Refresh") { appState.refreshFiles() }
-            }
+            NativeFileTableView(
+                rows: sortedRows,
+                selection: Binding(
+                    get: { appState.selectedFileIDs },
+                    set: { appState.setSelection($0) }
+                ),
+                icon: icon,
+                menuEntries: { targets in
+                    [
+                        .item(title: "Reveal in Finder", enabled: !targets.isEmpty) { revealInFinder(targets) },
+                        .item(title: "Reveal in Seeker", enabled: !targets.isEmpty) { revealInSeeker(targets) },
+                        .separator,
+                        .item(title: "Refresh", enabled: true) { appState.refreshFiles() }
+                    ]
+                },
+                onSortChanged: { field, ascending in
+                    sortField = field
+                    sortAscending = ascending
+                },
+                sortField: sortField,
+                sortAscending: sortAscending
+            )
             .background {
                 // Hidden ⌘C handler: copies the selected file's title (or its
                 // filename without extension if no title is known). Disabled when
@@ -145,45 +104,6 @@ struct FileListView: View {
                 }
             }
         }
-    }
-
-    private var tableHeader: some View {
-        HStack(spacing: 0) {
-            sortButton("#", field: .track)
-                .frame(width: 60, alignment: .leading)
-                .help("Sort by track number")
-            Divider()
-            sortButton("File", field: .file)
-            Divider()
-            sortButton("Title", field: .title)
-        }
-        .frame(height: 28)
-        .background(Color(nsColor: .controlBackgroundColor))
-        .font(.callout)
-    }
-
-    private func sortButton(_ title: String, field: FileListSortField) -> some View {
-        Button {
-            if sortField == field {
-                sortAscending.toggle()
-            } else {
-                sortField = field
-                sortAscending = true
-            }
-        } label: {
-            HStack(spacing: 5) {
-                Text(title)
-                if sortField == field {
-                    Image(systemName: sortAscending ? "chevron.up" : "chevron.down")
-                        .font(.caption2)
-                }
-                Spacer(minLength: 0)
-            }
-            .padding(.horizontal, 8)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
     }
 
     /// Show the given file URLs in Finder. When multiple URLs share a parent

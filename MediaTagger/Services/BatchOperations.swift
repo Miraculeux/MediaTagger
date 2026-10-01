@@ -41,6 +41,31 @@ struct FilenameCleanupOptions: Equatable {
 }
 
 enum FilenameCleaner {
+    static func filenameStem(from title: String) -> String {
+        var s = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        s = s.replacingOccurrences(of: "/", with: "-")
+        s = s.replacingOccurrences(of: ":", with: "-")
+        s = s.replacingOccurrences(of: "\\", with: "-")
+        s = s.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+        s = String(s.unicodeScalars.filter { $0.value >= 0x20 && $0.value != 0x7F })
+        return s.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    static func uniqueSiblingURL(for source: URL, stem: String) -> URL {
+        let directory = source.deletingLastPathComponent()
+        let ext = source.pathExtension
+        let name = ext.isEmpty ? stem : "\(stem).\(ext)"
+        if source.lastPathComponent == name { return source }
+        var candidate = directory.appendingPathComponent(name)
+        var number = 2
+        while FileManager.default.fileExists(atPath: candidate.path) {
+            let name = ext.isEmpty ? "\(stem) (\(number))" : "\(stem) (\(number)).\(ext)"
+            candidate = directory.appendingPathComponent(name)
+            number += 1
+        }
+        return candidate
+    }
+
     /// Returns a cleaned-up title from a filename. Always strips the extension.
     static func title(from filename: String, options: FilenameCleanupOptions = .init()) -> String {
         var s = (filename as NSString).deletingPathExtension

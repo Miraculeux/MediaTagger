@@ -59,6 +59,7 @@ struct MetadataEditorView: View {
                     } else {
                         standardFieldsSection
                     }
+                    titleFilenameSection
                     Divider()
                     otherTagsSection(md, isImage: isImage)
                 }
@@ -149,6 +150,29 @@ struct MetadataEditorView: View {
                 .frame(width: 100, alignment: .trailing)
             StandardField(key: key)
         }
+    }
+
+    private var titleFilenameSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if let file = appState.selectedFile {
+                Text(file.name)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            Button("Set title from filename") { appState.setTitleFromFilename() }
+                .help("Remove the extension and leading track number, replace underscores, and trim whitespace. Click Save to write the title.")
+            Toggle("Set filename from title on save", isOn: Binding(
+                get: { appState.filenameFromTitleOnSave },
+                set: { appState.setFilenameFromTitleOnSave($0) }
+            ))
+            if appState.filenameFromTitleOnSave {
+                Text("The file will be renamed when you click Save. The extension is preserved; existing files are not overwritten.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .disabled(!appState.canUseFilenameActions)
     }
 
     private var trackDiscRow: some View {
@@ -334,7 +358,7 @@ struct MetadataEditorView: View {
             .disabled(!appState.isDirty)
             Button("Save") { Task { await appState.saveCurrent() } }
                 .keyboardShortcut("s", modifiers: [.command])
-                .disabled(!appState.isDirty || appState.isSaving ||
+                .disabled((!appState.isDirty && !appState.filenameFromTitleOnSave) || appState.isSaving ||
                           appState.isLoadingMetadata || appState.batchInProgress)
                 .buttonStyle(.borderedProminent)
         }
