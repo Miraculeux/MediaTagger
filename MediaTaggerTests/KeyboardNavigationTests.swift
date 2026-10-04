@@ -181,6 +181,63 @@ final class KeyboardNavigationTests: XCTestCase {
     }
 
     @MainActor
+    func testTypingNarrowsManyFilteredRootsWithoutCrashingOrStealingFocus() async throws {
+        for index in 0..<80 {
+            try FileManager.default.createDirectory(
+                at: directory.appendingPathComponent("Band \(index)/Disc"), withIntermediateDirectories: true
+            )
+        }
+        let album = directory.appendingPathComponent("Brahms/Disc", isDirectory: true).deletingLastPathComponent()
+        try FileManager.default.createDirectory(
+            at: album.appendingPathComponent("Disc"), withIntermediateDirectories: true
+        )
+        let state = AppState(metadataWriter: { _, _ in })
+        state.rootURL = directory
+        state.selectedFolder = directory
+        let window = await host(SidebarView().environmentObject(state))
+        defer { window.close() }
+        let content = try XCTUnwrap(window.contentView)
+        let search = try XCTUnwrap(textField(in: content))
+        XCTAssertTrue(window.makeFirstResponder(search))
+        try sendKey("b", code: 11, to: window)
+        await settle()
+        let broad = try XCTUnwrap(table(in: content) as? FolderOutlineView)
+        XCTAssertEqual(broad.numberOfRows, 82)
+        broad.expandItem(try XCTUnwrap(broad.item(atRow: 1)))
+        await settle()
+        XCTAssertTrue(window.makeFirstResponder(search))
+        let broadEditor = try XCTUnwrap(window.firstResponder as? NSTextView)
+        broadEditor.setSelectedRange(NSRange(location: broadEditor.string.utf16.count, length: 0))
+        try sendKey("r", code: 15, to: window)
+        await settle()
+        XCTAssertEqual(search.stringValue, "br")
+        let narrow = try XCTUnwrap(table(in: content) as? FolderOutlineView)
+        XCTAssertEqual(narrow.numberOfRows, 1)
+        XCTAssertEqual((narrow.item(atRow: 0) as? FolderNode)?.url, album)
+        XCTAssertTrue(window.firstResponder is NSTextView)
+        let editor = try XCTUnwrap(window.firstResponder as? NSTextView)
+        editor.deleteBackward(nil)
+        await settle()
+        XCTAssertEqual(search.stringValue, "b")
+        XCTAssertEqual(narrow.numberOfRows, 82)
+        try sendKey("r", code: 15, to: window)
+        await settle()
+        XCTAssertEqual(narrow.numberOfRows, 1)
+        XCTAssertTrue(window.firstResponder is NSTextView)
+        try sendKey("zz", code: 6, to: window)
+        await settle()
+        XCTAssertNil(table(in: content))
+        let emptyEditor = try XCTUnwrap(window.firstResponder as? NSTextView)
+        emptyEditor.selectAll(nil)
+        emptyEditor.deleteBackward(nil)
+        await settle()
+        let restored = try XCTUnwrap(table(in: content) as? FolderOutlineView)
+        XCTAssertEqual(restored.numberOfRows, 1)
+        XCTAssertEqual((restored.item(atRow: 0) as? FolderNode)?.url, directory)
+        XCTAssertTrue(window.firstResponder is NSTextView)
+    }
+
+    @MainActor
     private func host<V: View>(_ view: V, size: NSSize = NSSize(width: 600, height: 500)) async -> NSWindow {
         let window = NSWindow(
             contentRect: NSRect(origin: .zero, size: size),

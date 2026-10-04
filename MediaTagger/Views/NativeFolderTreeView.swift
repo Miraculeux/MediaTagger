@@ -68,6 +68,7 @@ struct NativeFolderTreeView: NSViewRepresentable {
             defer { updatingSelection = false }
             let roots = parent.roots
             if displayedRoots.count != roots.count || zip(displayedRoots, roots).contains(where: { $0 !== $1 }) {
+                // Collapsing can ask for old, lazily loaded items before the new roots are reloaded.
                 outline.collapseItem(nil, collapseChildren: true)
                 displayedRoots = roots
                 navigation = FolderTreeNavigation()
@@ -85,12 +86,12 @@ struct NativeFolderTreeView: NSViewRepresentable {
         }
 
         func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
-            guard let node = item as? FolderNode else { return parent.roots.count }
+            guard let node = item as? FolderNode else { return displayedRoots.count }
             return node.children?.count ?? 0
         }
 
         func outlineView(_ outlineView: NSOutlineView, child index: Int, ofItem item: Any?) -> Any {
-            guard let node = item as? FolderNode else { return parent.roots[index] }
+            guard let node = item as? FolderNode else { return displayedRoots[index] }
             guard let children = node.children else {
                 preconditionFailure("Only expandable folders have child rows.")
             }
