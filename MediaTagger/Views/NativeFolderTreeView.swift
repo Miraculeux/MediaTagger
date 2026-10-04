@@ -5,6 +5,10 @@ struct NativeFolderTreeView: NSViewRepresentable {
     let root: FolderNode
     @Binding var selection: URL?
     let menuEntries: (URL) -> [BrowserMenuEntry]
+    var filteredRoots: [FolderNode]?
+    var relativePathRoot: URL?
+
+    private var roots: [FolderNode] { filteredRoots ?? [root] }
 
     func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
 
@@ -52,7 +56,7 @@ struct NativeFolderTreeView: NSViewRepresentable {
 
     final class Coordinator: NSObject, NSOutlineViewDataSource, NSOutlineViewDelegate {
         private var parent: NativeFolderTreeView
-        private var displayedRoot: FolderNode?
+        private var displayedRoots: [FolderNode] = []
         private var navigation = FolderTreeNavigation()
         private var updatingSelection = false
 
@@ -62,13 +66,15 @@ struct NativeFolderTreeView: NSViewRepresentable {
             self.parent = parent
             updatingSelection = true
             defer { updatingSelection = false }
-            if displayedRoot !== parent.root {
+            let roots = parent.roots
+            if displayedRoots.count != roots.count || zip(displayedRoots, roots).contains(where: { $0 !== $1 }) {
                 outline.collapseItem(nil, collapseChildren: true)
-                displayedRoot = parent.root
+                displayedRoots = roots
                 navigation = FolderTreeNavigation()
                 outline.reloadData()
             }
-            if let row = navigation.visibleRows(root: parent.root).first(where: { $0.id == parent.selection }) {
+            outline.rowHeight = parent.relativePathRoot == nil ? 24 : 42
+            if let row = navigation.visibleRows(roots: roots).first(where: { $0.id == parent.selection }) {
                 let index = outline.row(forItem: row.node)
                 if index >= 0, outline.selectedRow != index {
                     outline.selectRowIndexes(IndexSet(integer: index), byExtendingSelection: false)
@@ -79,12 +85,12 @@ struct NativeFolderTreeView: NSViewRepresentable {
         }
 
         func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
-            guard let node = item as? FolderNode else { return 1 }
+            guard let node = item as? FolderNode else { return parent.roots.count }
             return node.children?.count ?? 0
         }
 
         func outlineView(_ outlineView: NSOutlineView, child index: Int, ofItem item: Any?) -> Any {
-            guard let node = item as? FolderNode else { return parent.root }
+            guard let node = item as? FolderNode else { return parent.roots[index] }
             guard let children = node.children else {
                 preconditionFailure("Only expandable folders have child rows.")
             }
@@ -98,19 +104,26 @@ struct NativeFolderTreeView: NSViewRepresentable {
         func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
             guard let node = item as? FolderNode else { return nil }
             let identifier = NSUserInterfaceItemIdentifier("folderCell")
-            let cell: NSTableCellView
-            if let reused = outlineView.makeView(withIdentifier: identifier, owner: nil) as? NSTableCellView {
+            let cell: FolderTreeCellView
+            if let reused = outlineView.makeView(withIdentifier: identifier, owner: nil) as? FolderTreeCellView {
                 cell = reused
             } else {
-                cell = NSTableCellView()
+                cell = FolderTreeCellView()
                 cell.identifier = identifier
                 let image = NSImageView()
                 let text = NSTextField(labelWithString: "")
                 image.translatesAutoresizingMaskIntoConstraints = false
-                text.translatesAutoresizingMaskIntoConstraints = false
                 text.lineBreakMode = .byTruncatingMiddle
+                cell.pathLabel.font = .systemFont(ofSize: NSFont.smallSystemFontSize)
+                cell.pathLabel.textColor = .secondaryLabelColor
+                cell.pathLabel.lineBreakMode = .byTruncatingMiddle
+                let labels = NSStackView(views: [text, cell.pathLabel])
+                labels.orientation = .vertical
+                labels.alignment = .leading
+                labels.spacing = 1
+                labels.translatesAutoresizingMaskIntoConstraints = false
                 cell.addSubview(image)
-                cell.addSubview(text)
+                cell.addSubview(labels)
                 cell.imageView = image
                 cell.textField = text
                 NSLayoutConstraint.activate([
@@ -118,12 +131,20 @@ struct NativeFolderTreeView: NSViewRepresentable {
                     image.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
                     image.widthAnchor.constraint(equalToConstant: 16),
                     image.heightAnchor.constraint(equalToConstant: 16),
-                    text.leadingAnchor.constraint(equalTo: image.trailingAnchor, constant: 5),
-                    text.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4),
-                    text.centerYAnchor.constraint(equalTo: cell.centerYAnchor)
+                    labels.leadingAnchor.constraint(equalTo: image.trailingAnchor, constant: 5),
+                    labels.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4),
+                    labels.centerYAnchor.constraint(equalTo: cell.centerYAnchor),
+                    text.widthAnchor.constraint(equalTo: labels.widthAnchor),
+                    cell.pathLabel.widthAnchor.constraint(equalTo: labels.widthAnchor)
                 ])
             }
             cell.textField?.stringValue = node.url.lastPathComponent
+            if let root = parent.relativePathRoot {
+                cell.pathLabel.stringValue = FolderNode.relativePath(of: node.url, root: root) ?? node.url.path
+                cell.pathLabel.isHidden = false
+            } else {
+                cell.pathLabel.isHidden = true
+            }
             cell.imageView?.image = NSImage(systemSymbolName: "folder", accessibilityDescription: "Folder")
             cell.imageView?.contentTintColor = .controlAccentColor
             cell.toolTip = node.url.path
@@ -168,11 +189,11 @@ struct NativeFolderTreeView: NSViewRepresentable {
             let selection: URL?
             if code == 125 || code == 126 {
                 selection = navigation.moveVertically(
-                    root: parent.root, selection: node?.url, offset: code == 125 ? 1 : -1
+                    roots: parent.roots, selection: node?.url, offset: code == 125 ? 1 : -1
                 )
             } else {
                 selection = navigation.moveHorizontally(
-                    root: parent.root, selection: node?.url, expanding: code == 124
+                    roots: parent.roots, selection: node?.url, expanding: code == 124
                 )
                 if let node {
                     if navigation.expandedURLs.contains(node.url) {
@@ -182,7 +203,7 @@ struct NativeFolderTreeView: NSViewRepresentable {
                     }
                 }
             }
-            let visible = navigation.visibleRows(root: parent.root)
+            let visible = navigation.visibleRows(roots: parent.roots)
             guard let target = visible.first(where: { $0.id == selection }) else { return }
             let index = outline.row(forItem: target.node)
             guard index >= 0 else { return }
@@ -194,6 +215,10 @@ struct NativeFolderTreeView: NSViewRepresentable {
             makeBrowserMenu(parent.menuEntries(url))
         }
     }
+}
+
+final class FolderTreeCellView: NSTableCellView {
+    let pathLabel = NSTextField(labelWithString: "")
 }
 
 final class FolderOutlineView: NSOutlineView {

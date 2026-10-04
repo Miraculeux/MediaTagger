@@ -170,7 +170,7 @@ struct SidebarView: View {
 
     @ViewBuilder
     private func searchResults(in root: FolderNode) -> some View {
-        let matches = collectMatches(root: root, query: searchText, limit: 500)
+        let matches = root.matchingRoots(query: searchText, limit: 500)
         if matches.isEmpty {
             VStack(spacing: 8) {
                 Image(systemName: "folder.badge.questionmark")
@@ -181,27 +181,16 @@ struct SidebarView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
         } else {
-            List(selection: Binding(
-                get: { appState.selectedFolder },
-                set: { if let url = $0 { appState.loadFiles(in: url) } }
-            )) {
-                ForEach(matches, id: \.url) { node in
-                    VStack(alignment: .leading, spacing: 1) {
-                        Label(node.url.lastPathComponent, systemImage: "folder")
-                        if let rootURL = appState.rootURL,
-                           let relative = relativePath(of: node.url, root: rootURL) {
-                            Text(relative)
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                        }
-                    }
-                    .tag(node.url)
-                    .contextMenu { folderContextMenu(for: node.url) }
-                }
-            }
-            .listStyle(.sidebar)
+            NativeFolderTreeView(
+                root: root,
+                selection: Binding(
+                    get: { appState.selectedFolder },
+                    set: { if let url = $0 { appState.loadFiles(in: url) } }
+                ),
+                menuEntries: folderMenuEntries,
+                filteredRoots: matches,
+                relativePathRoot: appState.rootURL
+            )
         }
     }
 
@@ -369,32 +358,8 @@ struct SidebarView: View {
         }
     }
 
-    /// BFS the folder tree collecting nodes whose name contains `query`
-    /// (case-insensitive). Capped to keep the UI responsive on large libraries.
-    private func collectMatches(root: FolderNode, query: String, limit: Int) -> [FolderNode] {
-        let needle = query.lowercased()
-        var results: [FolderNode] = []
-        var queue: [FolderNode] = [root]
-        while !queue.isEmpty, results.count < limit {
-            let node = queue.removeFirst()
-            if node.url != root.url,
-               node.url.lastPathComponent.lowercased().contains(needle) {
-                results.append(node)
-            }
-            if let children = node.children {
-                queue.append(contentsOf: children)
-            }
-        }
-        return results
-    }
-
     private func relativePath(of url: URL, root: URL) -> String? {
-        let rootPath = root.path
-        let p = url.path
-        guard p.hasPrefix(rootPath) else { return nil }
-        var rel = String(p.dropFirst(rootPath.count))
-        if rel.hasPrefix("/") { rel.removeFirst() }
-        return rel.isEmpty ? nil : rel
+        FolderNode.relativePath(of: url, root: root)
     }
 
     /// Rebuild the root node (discarding the entire children cache) only when
@@ -512,7 +477,11 @@ struct FolderTreeNavigation {
     var expandedURLs: Set<URL> = []
 
     func moveVertically(root: FolderNode, selection: URL?, offset: Int) -> URL? {
-        let rows = visibleRows(root: root)
+        moveVertically(roots: [root], selection: selection, offset: offset)
+    }
+
+    func moveVertically(roots: [FolderNode], selection: URL?, offset: Int) -> URL? {
+        let rows = visibleRows(roots: roots)
         guard let index = rows.firstIndex(where: { $0.id == selection }) else {
             return offset > 0 ? rows.first?.id : rows.last?.id
         }
@@ -520,6 +489,10 @@ struct FolderTreeNavigation {
     }
 
     func visibleRows(root: FolderNode) -> [Row] {
+        visibleRows(roots: [root])
+    }
+
+    func visibleRows(roots: [FolderNode]) -> [Row] {
         func rows(_ node: FolderNode, depth: Int, parent: URL?) -> [Row] {
             var result = [Row(node: node, depth: depth, parent: parent)]
             if expandedURLs.contains(node.url), let children = node.children {
@@ -529,12 +502,16 @@ struct FolderTreeNavigation {
             }
             return result
         }
-        return rows(root, depth: 0, parent: nil)
+        return roots.flatMap { rows($0, depth: 0, parent: nil) }
     }
 
     mutating func moveHorizontally(root: FolderNode, selection: URL?, expanding: Bool) -> URL? {
-        guard let row = visibleRows(root: root).first(where: { $0.id == selection }) else {
-            return root.url
+        moveHorizontally(roots: [root], selection: selection, expanding: expanding)
+    }
+
+    mutating func moveHorizontally(roots: [FolderNode], selection: URL?, expanding: Bool) -> URL? {
+        guard let row = visibleRows(roots: roots).first(where: { $0.id == selection }) else {
+            return roots.first?.url
         }
         if expanding {
             guard let children = row.node.children else { return row.id }
@@ -573,6 +550,31 @@ final class FolderNode: Identifiable, Hashable {
             didScan = true
         }
         return cachedChildren
+    }
+
+    /// Matching ancestors own their full subtree, so descendants are not duplicated as result roots.
+    func matchingRoots(query: String, limit: Int) -> [FolderNode] {
+        let needle = query.lowercased()
+        var results: [FolderNode] = []
+        var queue = children ?? []
+        var index = 0
+        while index < queue.count, results.count < limit {
+            let node = queue[index]
+            index += 1
+            if node.url.lastPathComponent.lowercased().contains(needle) {
+                results.append(node)
+            } else if let children = node.children {
+                queue.append(contentsOf: children)
+            }
+        }
+        return results
+    }
+
+    static func relativePath(of url: URL, root: URL) -> String? {
+        let prefix = root.path.hasSuffix("/") ? root.path : root.path + "/"
+        guard url.path.hasPrefix(prefix) else { return nil }
+        let relative = String(url.path.dropFirst(prefix.count))
+        return relative.isEmpty ? nil : relative
     }
 
     static func == (lhs: FolderNode, rhs: FolderNode) -> Bool { lhs.url == rhs.url }

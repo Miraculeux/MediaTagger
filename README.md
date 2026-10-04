@@ -14,6 +14,11 @@ Three-pane `NavigationSplitView`:
    and Left collapses it (or selects its parent). The tree uses a native AppKit
    outline view: clicking a directory or disclosure triangle explicitly gives
    it keyboard focus, and arrows are handled directly by its responder.
+   Folder-name filtering keeps results expandable: a matching folder exposes
+   all its subfolders, including names that do not match the filter. Matching
+   descendants appear beneath their matching ancestor rather than as duplicate
+   top-level results. Filtered rows retain relative-path hints, keyboard
+   navigation, and the same folder context menu.
    Right-click a folder to reveal it in Finder/Seeker, scan for missing cover
    art, or repair/normalize covers in its subfolders.
 2. **File list** ([FileListView](MediaTagger/Views/FileListView.swift)) — media

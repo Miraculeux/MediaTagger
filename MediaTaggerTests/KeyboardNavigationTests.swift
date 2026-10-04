@@ -78,6 +78,108 @@ final class KeyboardNavigationTests: XCTestCase {
         XCTAssertEqual(navigation.moveVertically(root: root, selection: nil, offset: -1), b)
     }
 
+    func testFilteredRootsExcludeMatchingDescendantsButKeepFullSubtrees() throws {
+        let album = directory.appendingPathComponent(
+            "Brahms-The 4 Symphonies, Claudio Abbado - (2018) [3SACD]", isDirectory: true
+        )
+        let matchingChild = album.appendingPathComponent("Claudio Abbado - Brahms SACD 1", isDirectory: true)
+        let otherChild = album.appendingPathComponent("Disc 2", isDirectory: true)
+        let unrelated = directory.appendingPathComponent("a/Brahms - Violin Concerto", isDirectory: true)
+        for folder in [matchingChild, otherChild, unrelated] {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        }
+        let results = root.matchingRoots(query: "BRAHMS", limit: 500)
+        XCTAssertEqual(results.map(\.url), [album, unrelated])
+        XCTAssertEqual(root.matchingRoots(query: "brahms", limit: 1).map(\.url), [album])
+        XCTAssertTrue(root.matchingRoots(query: "no such folder", limit: 500).isEmpty)
+        XCTAssertTrue(root.matchingRoots(query: "brahms", limit: 0).isEmpty)
+        XCTAssertEqual(root.matchingRoots(query: "sacd 1", limit: 500).map(\.url), [matchingChild])
+        var navigation = FolderTreeNavigation()
+        XCTAssertEqual(navigation.visibleRows(roots: results).map(\.id), [album, unrelated])
+        XCTAssertEqual(navigation.moveHorizontally(roots: results, selection: album, expanding: true), album)
+        XCTAssertEqual(navigation.visibleRows(roots: results).map(\.id), [album, matchingChild, otherChild, unrelated])
+        XCTAssertEqual(navigation.moveVertically(roots: results, selection: otherChild, offset: 1), unrelated)
+        XCTAssertEqual(navigation.moveHorizontally(roots: results, selection: otherChild, expanding: false), album)
+        XCTAssertEqual(navigation.moveHorizontally(roots: results, selection: album, expanding: false), album)
+        XCTAssertEqual(navigation.visibleRows(roots: results).map(\.id), [album, unrelated])
+        XCTAssertNil(navigation.moveVertically(roots: [], selection: nil, offset: 1))
+        XCTAssertNil(navigation.moveHorizontally(roots: [], selection: nil, expanding: true))
+    }
+
+    @MainActor
+    func testFilteredSidebarExpandsAllChildrenAndLoadsFilesWithKeyboardAndDisclosure() async throws {
+        let album = directory.appendingPathComponent(
+            "Brahms-The 4 Symphonies, Claudio Abbado - (2018) [3SACD]", isDirectory: true
+        )
+        let disc = album.appendingPathComponent("Disc 1", isDirectory: true)
+        let matchingDisc = album.appendingPathComponent("Claudio Abbado - Brahms SACD 2", isDirectory: true)
+        for folder in [disc, matchingDisc] {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        }
+        let file = disc.appendingPathComponent("track.mp3")
+        try Data("FAKEMP3DATA".utf8).write(to: file)
+        try ID3v2File.write(url: file, entries: [("TITLE", "Symphony")], cover: nil)
+        let state = AppState(metadataWriter: { _, _ in })
+        state.rootURL = directory
+        state.selectedFolder = album
+        let window = await host(SidebarView().environmentObject(state))
+        defer { window.close() }
+        let content = try XCTUnwrap(window.contentView)
+        let search = try XCTUnwrap(textField(in: content))
+        XCTAssertTrue(window.makeFirstResponder(search))
+        try sendKey("brahms", code: 11, to: window)
+        await settle()
+        let outline = try XCTUnwrap(table(in: content) as? FolderOutlineView)
+        XCTAssertEqual(outline.numberOfRows, 1)
+        XCTAssertEqual((outline.item(atRow: 0) as? FolderNode)?.url, album)
+        let cell = try XCTUnwrap(outline.view(atColumn: 0, row: 0, makeIfNecessary: true) as? FolderTreeCellView)
+        XCTAssertEqual(cell.pathLabel.stringValue, album.lastPathComponent)
+        XCTAssertEqual(outline.folderMenu?(album)?.item(at: 0)?.title, "Reveal in Finder")
+        try click(outline.rect(ofRow: 0), in: outline, window: window)
+        try sendKey("\u{f703}", code: 124, to: window)
+        await settle()
+        XCTAssertEqual(outline.numberOfRows, 3)
+        XCTAssertEqual((outline.item(atRow: 1) as? FolderNode)?.url, matchingDisc)
+        XCTAssertEqual((outline.item(atRow: 2) as? FolderNode)?.url, disc)
+        XCTAssertTrue(window.firstResponder === outline)
+        try sendKey("\u{f703}", code: 124, to: window)
+        await settle()
+        XCTAssertEqual(state.selectedFolder, matchingDisc)
+        try sendKey("\u{f701}", code: 125, to: window)
+        await settle()
+        XCTAssertEqual(state.selectedFolder, disc)
+        XCTAssertEqual(state.files.map(\.url), [file])
+        XCTAssertEqual(search.stringValue, "brahms")
+        try sendKey("\u{f702}", code: 123, to: window)
+        await settle()
+        XCTAssertEqual(state.selectedFolder, album)
+        let row = try XCTUnwrap(outline.rowView(atRow: 0, makeIfNecessary: true))
+        let disclosure = try XCTUnwrap(button(in: row))
+        disclosure.performClick(nil)
+        await settle()
+        XCTAssertEqual(outline.numberOfRows, 1)
+        disclosure.performClick(nil)
+        await settle()
+        XCTAssertEqual(outline.numberOfRows, 3)
+        XCTAssertTrue(window.firstResponder === outline)
+        XCTAssertTrue(window.makeFirstResponder(search))
+        try sendKey("a", code: 0, modifiers: .command, to: window)
+        try sendKey("sacd 2", code: 1, to: window)
+        await settle()
+        let narrowed = try XCTUnwrap(table(in: content) as? FolderOutlineView)
+        XCTAssertEqual(narrowed.numberOfRows, 1)
+        XCTAssertEqual((narrowed.item(atRow: 0) as? FolderNode)?.url, matchingDisc)
+        let editor = try XCTUnwrap(window.firstResponder as? NSTextView)
+        editor.selectAll(nil)
+        editor.deleteBackward(nil)
+        await settle()
+        XCTAssertEqual(search.stringValue, "")
+        let unfiltered = try XCTUnwrap(table(in: content) as? FolderOutlineView)
+        XCTAssertEqual(unfiltered.numberOfRows, 1)
+        XCTAssertEqual((unfiltered.item(atRow: 0) as? FolderNode)?.url, directory)
+        XCTAssertTrue(window.firstResponder is NSTextView)
+    }
+
     @MainActor
     private func host<V: View>(_ view: V, size: NSSize = NSSize(width: 600, height: 500)) async -> NSWindow {
         let window = NSWindow(
