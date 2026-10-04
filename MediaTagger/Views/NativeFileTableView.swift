@@ -9,6 +9,8 @@ struct NativeFileTableView: NSViewRepresentable {
     let onSortChanged: (FileListSortField, Bool) -> Void
     var sortField: FileListSortField = .track
     var sortAscending = true
+    var canImportImages = false
+    var onImagesDropped: ([DroppedImageSource]) -> Void = { _ in }
 
     func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
 
@@ -46,6 +48,7 @@ struct NativeFileTableView: NSViewRepresentable {
         table.autoresizingMask = [.width]
         table.delegate = context.coordinator
         table.dataSource = context.coordinator
+        table.registerForDraggedTypes(DroppedImageImporter.pasteboardTypes)
         table.fileMenu = { [weak coordinator = context.coordinator] row in
             coordinator?.menu(at: row)
         }
@@ -85,6 +88,27 @@ struct NativeFileTableView: NSViewRepresentable {
         }
 
         func numberOfRows(in tableView: NSTableView) -> Int { displayedRows.count }
+
+        func tableView(
+            _ tableView: NSTableView, validateDrop info: NSDraggingInfo,
+            proposedRow row: Int, proposedDropOperation dropOperation: NSTableView.DropOperation
+        ) -> NSDragOperation {
+            guard parent.canImportImages,
+                  !DroppedImageImporter.sources(from: info.draggingPasteboard).isEmpty else { return [] }
+            tableView.setDropRow(-1, dropOperation: .above)
+            return .copy
+        }
+
+        func tableView(
+            _ tableView: NSTableView, acceptDrop info: NSDraggingInfo,
+            row: Int, dropOperation: NSTableView.DropOperation
+        ) -> Bool {
+            guard parent.canImportImages else { return false }
+            let sources = DroppedImageImporter.sources(from: info.draggingPasteboard)
+            guard !sources.isEmpty else { return false }
+            parent.onImagesDropped(sources)
+            return true
+        }
 
         func tableView(_ tableView: NSTableView, sortDescriptorsDidChange oldDescriptors: [NSSortDescriptor]) {
             guard !updatingSelection, let descriptor = tableView.sortDescriptors.first else { return }

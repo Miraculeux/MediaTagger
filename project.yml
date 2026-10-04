@@ -40,6 +40,7 @@ targets:
       path: MediaTagger/MediaTagger.entitlements
       properties:
         com.apple.security.app-sandbox: true
+        com.apple.security.network.client: true
         com.apple.security.files.user-selected.read-write: true
         com.apple.security.files.bookmarks.app-scope: true
     settings:

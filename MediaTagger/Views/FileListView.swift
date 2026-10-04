@@ -81,7 +81,12 @@ struct FileListView: View {
                     sortAscending = ascending
                 },
                 sortField: sortField,
-                sortAscending: sortAscending
+                sortAscending: sortAscending,
+                canImportImages: appState.selectedFolder != nil && !appState.isImportingImages,
+                onImagesDropped: { sources in
+                    guard let folder = appState.selectedFolder else { return }
+                    Task { await appState.importDroppedImages(sources, into: folder) }
+                }
             )
             .background {
                 // Hidden ⌘C handler: copies the selected file's title (or its
@@ -101,8 +106,27 @@ struct FileListView: View {
                         systemImage: "play.rectangle",
                         description: Text("Select a folder containing audio (FLAC, MP3, M4A, AIFF, MKA, OGG, …), video (MP4, MOV, MKV, …) or image (JPEG, TIFF, HEIC, PNG) files.")
                     )
+                    .allowsHitTesting(false)
                 }
             }
+            .overlay(alignment: .bottom) {
+                if appState.isImportingImages {
+                    ProgressView("Importing images…")
+                        .padding(12)
+                        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8))
+                        .padding(8)
+                        .allowsHitTesting(false)
+                }
+            }
+        }
+        .help("Drag an image from a browser or Finder to save it in the selected folder.")
+        .alert("Image import failed", isPresented: Binding(
+            get: { appState.imageImportError != nil },
+            set: { if !$0 { appState.imageImportError = nil } }
+        )) {
+            Button("OK", role: .cancel) { appState.imageImportError = nil }
+        } message: {
+            Text(appState.imageImportError ?? "")
         }
     }
 

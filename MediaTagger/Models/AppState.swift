@@ -58,6 +58,8 @@ final class AppState: ObservableObject {
     // Status / errors
     @Published var lastError: String?
     @Published var isDirty: Bool = false
+    @Published private(set) var isImportingImages = false
+    @Published var imageImportError: String?
 
     private var rootBookmark: Data?
     private let bookmarkKey = "rootBookmark"
@@ -131,6 +133,30 @@ final class AppState: ObservableObject {
     }
 
     // MARK: - File list
+
+    func importDroppedImages(_ sources: [DroppedImageSource], into folder: URL) async {
+        guard !isImportingImages else {
+            imageImportError = "An image import is already in progress."
+            return
+        }
+        isImportingImages = true
+        imageImportError = nil
+        defer { isImportingImages = false }
+        for source in sources {
+            do {
+                let url = try await Task.detached(priority: .userInitiated) {
+                    try await DroppedImageImporter.importImage(source, into: folder)
+                }.value
+                // Do not reload the folder: that would discard unsaved metadata edits.
+                if selectedFolder == folder, !files.contains(where: { $0.id == url }) {
+                    files.append(MediaFile(id: url))
+                }
+            } catch {
+                let message = error.localizedDescription
+                imageImportError = [imageImportError, message].compactMap { $0 }.joined(separator: "\n")
+            }
+        }
+    }
 
     func loadFiles(in folder: URL) {
         selectedFolder = folder

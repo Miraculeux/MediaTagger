@@ -30,6 +30,14 @@ Three-pane `NavigationSplitView`:
    leave text selection in search and metadata fields unchanged. The native
    table explicitly takes keyboard focus when clicked, so switching between
    the directory tree and file list routes keys to the pane you last clicked.
+   Drag images from a browser or Finder into this pane to save them in the
+   selected folder, including when the folder is empty. Browser image URLs
+   are downloaded (HTTP/HTTPS); image data and local image files are also
+   accepted. The image content determines the extension, and formats outside
+   the supported image list are converted to PNG. Existing files are never
+   overwritten: duplicate names receive a numeric suffix. Imports preserve
+   the current selection and unsaved metadata edits, display progress, and
+   report download, image decoding, or write failures.
 3. **Detail pane** ([DetailPane](MediaTagger/Views/DetailPane.swift)) —
    - [PlayerView](MediaTagger/Views/PlayerView.swift): inline AVKit transport
      for supported formats.
